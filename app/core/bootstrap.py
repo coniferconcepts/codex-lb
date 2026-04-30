@@ -36,19 +36,26 @@ def log_bootstrap_token(logger: logging.Logger, token: str, *, reason: str = "fi
     # container/root logger level (which defaults to WARNING in most docker
     # setups, silently dropping an INFO log and leaving operators unable to
     # find the token). See #458.
+    prefix = token[:8]
+    suffix = token[-4:] if len(token) > 4 else token
     logger.warning(
         "\n"
         "============================================\n"
         "  Dashboard bootstrap token (%s):\n"
-        "  %s\n"
+        "  %s...%s\n"
         "\n"
         "  Use this token for initial remote setup.\n"
+        "  Full token emission is disabled by default.\n"
+        "  Set CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN_EMIT_FULL=true to opt in.\n"
         "  It is shared across replicas and stays\n"
         "  valid until a password is set.\n"
         "============================================",
         reason,
-        token,
+        prefix,
+        suffix,
     )
+    if get_settings().dashboard_bootstrap_token_emit_full:
+        print(f"[codex-lb] Dashboard bootstrap token ({reason}): {token}")
 
 
 async def get_active_bootstrap_token() -> str | None:

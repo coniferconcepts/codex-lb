@@ -16,7 +16,10 @@ pytestmark = pytest.mark.unit
 def _patch_settings(monkeypatch: pytest.MonkeyPatch, *, token: str | None) -> None:
     monkeypatch.setattr(
         "app.core.bootstrap.get_settings",
-        lambda: SimpleNamespace(dashboard_bootstrap_token=token),
+        lambda: SimpleNamespace(
+            dashboard_bootstrap_token=token,
+            dashboard_bootstrap_token_emit_full=False,
+        ),
     )
 
 
@@ -168,7 +171,7 @@ async def test_ensure_auto_bootstrap_token_reuses_existing_encrypted_token(monke
     repository.store_bootstrap_token_if_absent.assert_not_called()
 
 
-def test_log_bootstrap_token_emits_at_warning_level_so_docker_default_surfaces_it() -> None:
+def test_log_bootstrap_token_redacts_secret_by_default() -> None:
     """Regression guard for #458.
 
     The token must be logged at a level that survives docker's default
@@ -177,7 +180,6 @@ def test_log_bootstrap_token_emits_at_warning_level_so_docker_default_surfaces_i
     """
     import io
     import logging
-
     handler_stream = io.StringIO()
     handler = logging.StreamHandler(handler_stream)
     handler.setLevel(logging.WARNING)
@@ -193,4 +195,40 @@ def test_log_bootstrap_token_emits_at_warning_level_so_docker_default_surfaces_i
 
     output = handler_stream.getvalue()
     assert "Dashboard bootstrap token" in output
-    assert "tok-regression-458" in output
+    assert "tok-regr...-458" in output
+    assert "tok-regression-458" not in output
+
+
+def test_log_bootstrap_token_can_emit_full_secret_when_explicitly_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+    import io
+    import logging
+
+    emitted: list[str] = []
+
+    def fake_print(*args, **kwargs) -> None:
+        emitted.append(" ".join(str(arg) for arg in args))
+
+    monkeypatch.setattr(
+        "app.core.bootstrap.get_settings",
+        lambda: SimpleNamespace(
+            dashboard_bootstrap_token=None,
+            dashboard_bootstrap_token_emit_full=True,
+        ),
+    )
+    monkeypatch.setattr(builtins, "print", fake_print)
+
+    handler_stream = io.StringIO()
+    handler = logging.StreamHandler(handler_stream)
+    handler.setLevel(logging.WARNING)
+    test_logger = logging.getLogger("app.core.bootstrap.test_emit_full")
+    test_logger.setLevel(logging.WARNING)
+    test_logger.addHandler(handler)
+    test_logger.propagate = False
+
+    try:
+        bootstrap_module.log_bootstrap_token(test_logger, "tok-regression-458")
+    finally:
+        test_logger.removeHandler(handler)
+
+    assert any("tok-regression-458" in line for line in emitted)

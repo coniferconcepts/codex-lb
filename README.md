@@ -49,7 +49,9 @@ Load balancer for ChatGPT accounts. Pool multiple accounts, track usage, manage 
 # Docker (recommended)
 docker volume create codex-lb-data
 docker run -d --name codex-lb \
-  -p 2455:2455 -p 1455:1455 \
+  -e CODEX_LB_BIND_HOST=0.0.0.0 \
+  -e CODEX_LB_ALLOW_NONLOCAL_BIND=true \
+  -p 127.0.0.1:2455:2455 -p 127.0.0.1:1455:1455 \
   -v codex-lb-data:/var/lib/codex-lb \
   ghcr.io/soju06/codex-lb:latest
 
@@ -59,17 +61,56 @@ uvx codex-lb
 
 Open [localhost:2455](http://localhost:2455) → Add account → Done.
 
+### Local-first bind safety
+
+This fork defaults to **loopback-only** binding for direct local runs.
+
+- direct local run default: `127.0.0.1`
+- Docker/remote bind requires explicit opt-in:
+
+```bash
+export CODEX_LB_BIND_HOST=0.0.0.0
+export CODEX_LB_ALLOW_NONLOCAL_BIND=true
+```
+
+The metrics server is also loopback-only by default. Override only if you
+intentionally expose it behind a trusted boundary.
+
+For personal local use behind another router, prefer loopback-only Docker port
+publishing as shown above.
+
 ## Remote Setup
 
 When accessing the dashboard remotely for the first time, a bootstrap token is required to set the initial password.
 
-**Auto-generated (default):** On first startup (no password configured), the server generates a one-time token and prints it to logs:
+**Auto-generated (default):** On first startup (no password configured), the server generates a one-time token and logs only a **redacted** form by default.
+
+For this fork's local-first posture, prefer setting your own manual token if you need remote bootstrap:
+
+```bash
+docker run -d --name codex-lb \
+  -e CODEX_LB_BIND_HOST=0.0.0.0 \
+  -e CODEX_LB_ALLOW_NONLOCAL_BIND=true \
+  -e CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN=your-secret-token \
+  -p 127.0.0.1:2455:2455 -p 127.0.0.1:1455:1455 \
+  -v codex-lb-data:/var/lib/codex-lb \
+  ghcr.io/soju06/codex-lb:latest
+```
+
+If you intentionally want the full auto-generated token emitted to process output,
+set:
+
+```bash
+CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN_EMIT_FULL=true
+```
+
+Example redacted startup log:
 
 ```bash
 docker logs codex-lb
 # ============================================
 #   Dashboard bootstrap token (first-run):
-#   <token>
+#   <prefix>...<suffix>
 # ============================================
 ```
 

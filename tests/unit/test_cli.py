@@ -33,6 +33,45 @@ def test_main_passes_timestamped_log_config(monkeypatch):
     assert formatters["access"]["fmt"].startswith("%(asctime)s ")
 
 
+def test_main_prefers_codex_lb_bind_host_env(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_run(*args, **kwargs):
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setenv("CODEX_LB_BIND_HOST", "127.0.0.1")
+    monkeypatch.setenv("HOST", "0.0.0.0")
+    monkeypatch.setattr(sys, "argv", ["codex-lb"])
+    monkeypatch.setattr(cli.uvicorn, "run", fake_run)
+
+    cli.main()
+
+    assert captured["kwargs"]["host"] == "127.0.0.1"
+
+
+def test_main_rejects_nonlocal_bind_without_explicit_override(monkeypatch):
+    monkeypatch.delenv("CODEX_LB_ALLOW_NONLOCAL_BIND", raising=False)
+    monkeypatch.setattr(sys, "argv", ["codex-lb", "--host", "0.0.0.0"])
+
+    with pytest.raises(SystemExit, match="Refusing non-local bind host"):
+        cli.main()
+
+
+def test_main_allows_nonlocal_bind_with_explicit_override(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_run(*args, **kwargs):
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setenv("CODEX_LB_ALLOW_NONLOCAL_BIND", "true")
+    monkeypatch.setattr(sys, "argv", ["codex-lb", "--host", "0.0.0.0"])
+    monkeypatch.setattr(cli.uvicorn, "run", fake_run)
+
+    cli.main()
+
+    assert captured["kwargs"]["host"] == "0.0.0.0"
+
+
 def test_utc_default_formatter_formats_without_converter_binding_error():
     formatter = UtcDefaultFormatter(
         fmt="%(asctime)s %(message)s",

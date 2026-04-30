@@ -5,12 +5,13 @@ import os
 
 import uvicorn
 
+from app.core.bind_policy import assert_bind_host_allowed, resolve_allow_nonlocal_bind, resolve_bind_host
 from app.core.runtime_logging import build_log_config
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the codex-lb API server.")
-    parser.add_argument("--host", default=os.getenv("HOST", "127.0.0.1"))
+    parser.add_argument("--host", default=resolve_bind_host(os.environ))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "2455")))
     parser.add_argument("--ssl-certfile", default=os.getenv("SSL_CERTFILE"))
     parser.add_argument("--ssl-keyfile", default=os.getenv("SSL_KEYFILE"))
@@ -23,6 +24,11 @@ def main() -> None:
 
     if bool(args.ssl_certfile) ^ bool(args.ssl_keyfile):
         raise SystemExit("Both --ssl-certfile and --ssl-keyfile must be provided together.")
+
+    assert_bind_host_allowed(
+        args.host,
+        allow_nonlocal_bind=resolve_allow_nonlocal_bind(os.environ),
+    )
 
     os.environ["PORT"] = str(args.port)
 

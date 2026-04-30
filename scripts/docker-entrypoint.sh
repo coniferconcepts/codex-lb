@@ -9,4 +9,6 @@ fi
 # run migrations again inside the app process.
 export CODEX_LB_DATABASE_MIGRATE_ON_STARTUP=false
 
-exec python -m app.cli --host 0.0.0.0 --port 2455
+: "${CODEX_LB_BIND_HOST:=127.0.0.1}"
+
+exec python -m app.cli --host "$CODEX_LB_BIND_HOST" --port 2455

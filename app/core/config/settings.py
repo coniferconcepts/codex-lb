@@ -209,6 +209,7 @@ class Settings(BaseSettings):
     # --- Multi-replica & production settings ---
     # Prometheus metrics
     metrics_enabled: bool = False
+    metrics_host: str = "127.0.0.1"
     metrics_port: int = 9090
 
     # Logging
@@ -242,6 +243,7 @@ class Settings(BaseSettings):
     bulkhead_proxy_compact_limit: int | None = Field(default=None, ge=0)
     bulkhead_dashboard_limit: int = Field(default=50, ge=0)
     dashboard_bootstrap_token: str | None = None
+    dashboard_bootstrap_token_emit_full: bool = False
     proxy_token_refresh_limit: int = Field(default=64, ge=0)
     proxy_upstream_websocket_connect_limit: int = Field(default=128, ge=0)
     proxy_response_create_limit: int = Field(default=256, ge=0)

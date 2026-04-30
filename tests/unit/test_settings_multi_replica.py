@@ -11,6 +11,7 @@ pytestmark = pytest.mark.unit
 def test_settings_multi_replica_defaults():
     settings = Settings()
     assert settings.metrics_enabled is False
+    assert settings.metrics_host == "127.0.0.1"
     assert settings.metrics_port == 9090
     assert settings.log_format == "text"
     assert settings.leader_election_enabled is False
@@ -47,6 +48,12 @@ def test_settings_metrics_port_from_env(monkeypatch):
     monkeypatch.setenv("CODEX_LB_METRICS_PORT", "8080")
     settings = Settings()
     assert settings.metrics_port == 8080
+
+
+def test_settings_metrics_host_from_env(monkeypatch):
+    monkeypatch.setenv("CODEX_LB_METRICS_HOST", "0.0.0.0")
+    settings = Settings()
+    assert settings.metrics_host == "0.0.0.0"
 
 
 def test_settings_rejects_metrics_port_2455(monkeypatch):

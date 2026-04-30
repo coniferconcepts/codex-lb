@@ -61,6 +61,30 @@ uvx codex-lb
 
 Open [localhost:2455](http://localhost:2455) → Add account → Done.
 
+## From a source clone
+
+If you cloned this repo directly and want the **full local dashboard + API**,
+you must build both the Python environment and the frontend assets.
+
+```bash
+uv sync
+cd frontend
+bun install
+bun run build
+cd ..
+.venv/bin/python -m app.cli --port 2455
+```
+
+Without the frontend build step, the root UI will only return the
+"Frontend assets are missing" error.
+
+After the server starts:
+
+1. open `http://127.0.0.1:2455`
+2. sign in with your account
+3. if another local router will call this sidecar, enable API key auth and
+   create a restricted `sk-clb-*` key
+
 ### Local-first bind safety
 
 This fork defaults to **loopback-only** binding for direct local runs.

@@ -85,6 +85,14 @@ After the server starts:
 3. if another local router will call this sidecar, enable API key auth and
    create a restricted `sk-clb-*` key
 
+If you are pairing this clone with `opencode-router`, the router repo now ships
+helpers you can run from there:
+
+```bash
+bash scripts/start-codex-sidecar.sh
+bash scripts/check-codex-sidecar.sh --router
+```
+
 ### Local-first bind safety
 
 This fork defaults to **loopback-only** binding for direct local runs.

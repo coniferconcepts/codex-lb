@@ -3,7 +3,7 @@ FROM oven/bun:1.3.7-alpine AS frontend-build
 
 WORKDIR /app/frontend
 
-COPY frontend/package.json frontend/bun.lock ./
+COPY frontend/package.json frontend/bun.lock frontend/bunfig.toml frontend/.npmrc ./
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile
 

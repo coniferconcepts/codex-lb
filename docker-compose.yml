@@ -48,11 +48,6 @@ services:
       API_PROXY_TARGET: http://server:2455
     develop:
       watch:
-        - action: sync
-          path: ./frontend
-          target: /app
-          ignore:
-            - node_modules/
         - action: rebuild
           path: ./frontend/package.json
         - action: rebuild
@@ -61,6 +56,15 @@ services:
           path: ./frontend/bunfig.toml
         - action: rebuild
           path: ./frontend/.npmrc
+        - action: sync
+          path: ./frontend
+          target: /app
+          ignore:
+            - node_modules/
+            - bunfig.toml
+            - .npmrc
+            - package.json
+            - bun.lock
 
   postgres:
     image: postgres:16-alpine

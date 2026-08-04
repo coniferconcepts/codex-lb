@@ -1,0 +1,6 @@
+# Supply-chain baseline (portfolio 2026-08-04)
+# Frontend package root — checker allowlist is codex-lb/frontend
+[install]
+ignoreScripts = true
+minimumReleaseAge = 432000
+exact = true

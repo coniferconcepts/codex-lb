@@ -1,0 +1,5 @@
+model: grok-structural
+effort: high
+command: structural supply-chain baseline review
+exit: 0
+findings: residual-only

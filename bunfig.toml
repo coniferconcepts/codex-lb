@@ -1,0 +1,5 @@
+# Supply-chain baseline
+[install]
+ignoreScripts = true
+minimumReleaseAge = 432000
+exact = true

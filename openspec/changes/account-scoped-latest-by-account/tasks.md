@@ -13,3 +13,9 @@
 ## 3. Validation
 
 - [x] 3.1 Run OpenSpec validation, Ruff, ty, and the targeted pytest suite.
+
+## 4. Review hardening
+
+- [x] 4.1 Add caller-forwarding spy tests for `AccountsService.list_accounts` and `DashboardService.get_overview`.
+- [x] 4.2 Add a PostgreSQL compile test for the production account-scoped lateral statement.
+- [x] 4.3 Pin endpoint account scoping with an orphan-row test.

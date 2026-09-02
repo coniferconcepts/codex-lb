@@ -150,6 +150,42 @@ async def test_latest_by_account_account_filter_is_inside_sqlite_window_query(db
 
 
 @pytest.mark.asyncio
+async def test_latest_by_account_account_filter_compiles_postgresql_lateral_query(db_setup, monkeypatch):
+    async with SessionLocal() as session:
+        if _dialect_name(session) != "postgresql":
+            pytest.skip("PostgreSQL-only SQL-shape test")
+
+        repo = UsageRepository(session)
+        captured_statements = []
+
+        class _EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        async def capture_execute(statement, *args, **kwargs):
+            del args, kwargs
+            captured_statements.append(statement)
+            return _EmptyResult()
+
+        monkeypatch.setattr(session, "execute", capture_execute)
+        await repo.latest_by_account(window="primary", account_ids=["acc1", "acc2"])
+
+        compiled_sql = str(
+            captured_statements[0].compile(
+                dialect=session.get_bind().dialect,
+                compile_kwargs={"literal_binds": True},
+            )
+        ).lower()
+        assert "from accounts as accts" in compiled_sql
+        assert "where accounts.id in ('acc1', 'acc2')" in compiled_sql
+        assert "usage_history.account_id = accts.id" in compiled_sql
+        assert "order by usage_history.recorded_at desc, usage_history.id desc" in compiled_sql
+
+
+@pytest.mark.asyncio
 async def test_latest_by_account_account_filter_matches_unfiltered_rows(db_setup):
     now = utcnow()
     async with SessionLocal() as session:

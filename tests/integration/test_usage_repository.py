@@ -179,7 +179,8 @@ async def test_latest_by_account_account_filter_compiles_postgresql_lateral_quer
                 compile_kwargs={"literal_binds": True},
             )
         ).lower()
-        assert "from accounts as accts" in compiled_sql
+        assert ") as accts" in compiled_sql
+        assert "join lateral" in compiled_sql
         assert "where accounts.id in ('acc1', 'acc2')" in compiled_sql
         assert "usage_history.account_id = accts.id" in compiled_sql
         assert "order by usage_history.recorded_at desc, usage_history.id desc" in compiled_sql

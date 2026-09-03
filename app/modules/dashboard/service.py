@@ -44,8 +44,9 @@ class DashboardService:
         now = utcnow()
         overview_timeframe = resolve_overview_timeframe(timeframe_key)
         accounts = await self._repo.list_accounts()
-        primary_usage = await self._repo.latest_usage_by_account("primary")
-        secondary_usage = await self._repo.latest_usage_by_account("secondary")
+        account_ids = [account.id for account in accounts]
+        primary_usage = await self._repo.latest_usage_by_account("primary", account_ids=account_ids)
+        secondary_usage = await self._repo.latest_usage_by_account("secondary", account_ids=account_ids)
 
         account_summaries = build_account_summaries(
             accounts=accounts,

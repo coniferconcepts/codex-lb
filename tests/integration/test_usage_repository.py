@@ -12,7 +12,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
-from app.modules.usage.repository import UsageRepository
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 pytestmark = pytest.mark.integration
 
@@ -111,6 +111,124 @@ async def test_latest_by_account_uses_recorded_at_with_deterministic_tie_breaker
 
         latest = await repo.latest_by_account(window="primary")
         assert latest["acc1"].used_percent == 30.0
+
+
+@pytest.mark.asyncio
+async def test_latest_by_account_account_filter_is_inside_sqlite_window_query(db_setup, monkeypatch):
+    async with SessionLocal() as session:
+        if _dialect_name(session) != "sqlite":
+            pytest.skip("SQLite-only SQL-shape test")
+
+        repo = UsageRepository(session)
+        captured_statements = []
+
+        class _EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        async def capture_execute(statement, *args, **kwargs):
+            del args, kwargs
+            captured_statements.append(statement)
+            return _EmptyResult()
+
+        monkeypatch.setattr(session, "execute", capture_execute)
+        await repo.latest_by_account(window="primary", account_ids=["acc1", "acc2"])
+
+        compiled_sql = str(
+            captured_statements[0].compile(
+                dialect=session.get_bind().dialect,
+                compile_kwargs={"literal_binds": True},
+            )
+        ).lower()
+        ranked_sql = compiled_sql[compiled_sql.index("join (select") :]
+        assert "account_id in ('acc1', 'acc2')" in ranked_sql
+        assert ranked_sql.index("account_id in") < ranked_sql.index(") as anon_1")
+        assert "order by usage_history.recorded_at desc, usage_history.id desc" in ranked_sql
+
+
+@pytest.mark.asyncio
+async def test_latest_by_account_account_filter_compiles_postgresql_lateral_query(db_setup, monkeypatch):
+    async with SessionLocal() as session:
+        if _dialect_name(session) != "postgresql":
+            pytest.skip("PostgreSQL-only SQL-shape test")
+
+        repo = UsageRepository(session)
+        captured_statements = []
+
+        class _EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        async def capture_execute(statement, *args, **kwargs):
+            del args, kwargs
+            captured_statements.append(statement)
+            return _EmptyResult()
+
+        monkeypatch.setattr(session, "execute", capture_execute)
+        await repo.latest_by_account(window="primary", account_ids=["acc1", "acc2"])
+
+        compiled_sql = str(
+            captured_statements[0].compile(
+                dialect=session.get_bind().dialect,
+                compile_kwargs={"literal_binds": True},
+            )
+        ).lower()
+        assert ") as accts" in compiled_sql
+        assert "join lateral" in compiled_sql
+        assert "where accounts.id in ('acc1', 'acc2')" in compiled_sql
+        assert "usage_history.account_id = accts.id" in compiled_sql
+        assert "order by usage_history.recorded_at desc, usage_history.id desc" in compiled_sql
+
+
+@pytest.mark.asyncio
+async def test_latest_by_account_account_filter_matches_unfiltered_rows(db_setup):
+    now = utcnow()
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        additional_repo = AdditionalUsageRepository(session)
+        await accounts_repo.upsert(_make_account("acc1"))
+        await accounts_repo.upsert(_make_account("acc2"))
+
+        await usage_repo.add_entry("acc1", 10.0, window="primary", recorded_at=now - timedelta(hours=2))
+        await usage_repo.add_entry("acc2", 20.0, window="primary", recorded_at=now - timedelta(hours=1))
+        await usage_repo.add_entry("acc1", 30.0, window="primary", recorded_at=now)
+        await usage_repo.add_entry("acc2", 40.0, window="primary", recorded_at=now)
+
+        unfiltered_usage = await usage_repo.latest_by_account(window="primary")
+        scoped_usage = await usage_repo.latest_by_account(window="primary", account_ids=["acc1"])
+        assert scoped_usage == {"acc1": unfiltered_usage["acc1"]}
+
+        await additional_repo.add_entry(
+            "acc1",
+            "codex_spark",
+            "codex_spark",
+            "primary",
+            15.0,
+            recorded_at=now - timedelta(hours=1),
+        )
+        await additional_repo.add_entry(
+            "acc2",
+            "codex_spark",
+            "codex_spark",
+            "primary",
+            25.0,
+            recorded_at=now,
+        )
+
+        unfiltered_additional = await additional_repo.latest_by_account("codex_spark", "primary")
+        scoped_additional = await additional_repo.latest_by_account(
+            "codex_spark",
+            "primary",
+            account_ids=["acc1"],
+        )
+        assert scoped_additional == {"acc1": unfiltered_additional["acc1"]}
 
 
 @pytest.mark.asyncio

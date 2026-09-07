@@ -16,7 +16,9 @@ For higher concurrency or infrastructure-managed deployments, PostgreSQL support
 - SQLite default URL: `sqlite+aiosqlite:///~/.codex-lb/store.db`
 - SQLite startup check mode: `CODEX_LB_DATABASE_SQLITE_STARTUP_CHECK_MODE=quick|full|off` (default `quick`)
 - PostgreSQL example URL: `postgresql+asyncpg://codex_lb:codex_lb@127.0.0.1:5432/codex_lb`
-- Pool controls (`database_pool_size`, `database_max_overflow`, `database_pool_timeout_seconds`) apply to non-memory SQLite and PostgreSQL engine creation.
+- Pool sizing (`database_pool_size`, `database_max_overflow`) applies to PostgreSQL engine creation; the pool checkout timeout (30 s) and connection recycle window (1800 s) are fixed constants in `app/db/session.py` (issue #1340 phase 3).
+- The background/request-adjacent DB engine always derives its pool sizing from `database_pool_size` and `database_max_overflow`; it isolates background-task checkouts rather than being sized independently.
+- A supported application replica runs one worker with two independently pooled PostgreSQL engine roles (request path and background tasks), so its maximum application connection count is `2 * (database_pool_size + database_max_overflow)`. The owned CLI pins one Uvicorn worker even if `WEB_CONCURRENCY` is present; custom multi-worker launchers are unsupported.
 
 ## Example
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -14,6 +15,44 @@ from uvicorn.logging import AccessFormatter, DefaultFormatter
 
 from app.core.types import JsonValue
 from app.core.utils.request_id import get_request_id
+
+_SENSITIVE_LOG_VALUE_PATTERNS = (
+    re.compile(r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)(\s*[=:]\s*)([^\s,&]+)"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)(authorization\s*[=:]\s*)(?!\s*bearer\b)([^,&]+)"),
+)
+_JSON_SENSITIVE_LOG_VALUE_PATTERN = re.compile(
+    r'(?i)("(?:password|passwd|pwd|token|secret|api[_-]?key|authorization)"\s*:\s*")'
+    r'(?:\\.|[^"\\])*(")'
+)
+_LOG_REDACTION = "[REDACTED]"
+
+
+def _redact_log_value(value: str | None) -> str | None:
+    collapsed = _collapse_log_value(value)
+    if collapsed is None:
+        return None
+    redacted = collapsed
+    redacted = _JSON_SENSITIVE_LOG_VALUE_PATTERN.sub(_redact_json_secret, redacted)
+    redacted = _SENSITIVE_LOG_VALUE_PATTERNS[0].sub(_redact_keyed_secret, redacted)
+    redacted = _SENSITIVE_LOG_VALUE_PATTERNS[1].sub(_redact_bearer_token, redacted)
+    return _SENSITIVE_LOG_VALUE_PATTERNS[2].sub(_redact_authorization_value, redacted)
+
+
+def _redact_keyed_secret(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{match.group(2)}{_LOG_REDACTION}"
+
+
+def _redact_json_secret(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{_LOG_REDACTION}{match.group(2)}"
+
+
+def _redact_bearer_token(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{_LOG_REDACTION}"
+
+
+def _redact_authorization_value(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{_LOG_REDACTION}"
 
 
 def _utc_converter(seconds: float | None) -> time.struct_time:
@@ -114,6 +153,7 @@ def build_log_config() -> LogConfig:
 
     config = copy.deepcopy(LOGGING_CONFIG)
     formatters = config.setdefault("formatters", {})
+    handlers = config.setdefault("handlers", {})
     settings = get_settings()
 
     if settings.log_format == "json":
@@ -139,6 +179,17 @@ def build_log_config() -> LogConfig:
             "datefmt": "%Y-%m-%dT%H:%M:%SZ",
             "use_colors": None,
         }
+
+    # Uvicorn's stock config only wires uvicorn.* loggers. Attach the same
+    # default handler to the root logger so application loggers such as
+    # app.core.balancer.logic surface in docker logs at INFO.
+    handlers.setdefault(
+        "default", {"class": "logging.StreamHandler", "formatter": "default", "stream": "ext://sys.stderr"}
+    )
+    config["root"] = {
+        "handlers": ["default"],
+        "level": "INFO",
+    }
     return cast(LogConfig, config)
 
 
@@ -161,10 +212,17 @@ def log_error_response(
         request.method,
         request.url.path,
         status_code,
-        code,
-        _collapse_log_value(message),
+        _error_log_field(code),
+        _error_log_field(message),
         exc_info=exc_info,
     )
+
+
+def _error_log_field(value: str | None) -> str:
+    redacted = _redact_log_value(value)
+    if redacted is None:
+        return "-"
+    return json.dumps(redacted)
 
 
 def _collapse_log_value(value: str | None) -> str | None:

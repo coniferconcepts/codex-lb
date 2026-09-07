@@ -6,14 +6,14 @@ export const LIMIT_WINDOWS = ["daily", "weekly", "monthly", "5h", "7d"] as const
 export type LimitType = (typeof LIMIT_TYPES)[number];
 export type LimitWindowType = (typeof LIMIT_WINDOWS)[number];
 
-export const LimitRuleSchema = z.object({
+const LimitRuleSchema = z.object({
   id: z.number(),
   limitType: z.enum(LIMIT_TYPES),
   limitWindow: z.enum(LIMIT_WINDOWS),
   maxValue: z.number(),
   currentValue: z.number(),
   modelFilter: z.string().nullable(),
-  resetAt: z.string().datetime({ offset: true }),
+  resetAt: z.iso.datetime({ offset: true }),
 });
 
 export const LimitRuleCreateSchema = z.object({
@@ -23,54 +23,83 @@ export const LimitRuleCreateSchema = z.object({
   modelFilter: z.string().nullable().optional(),
 });
 
-export const ApiKeyUsageSummarySchema = z.object({
+const ApiKeyUsageSummarySchema = z.object({
   requestCount: z.number().int().nonnegative(),
   totalTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
   totalCostUsd: z.number().nonnegative().default(0),
 });
 
-export const SERVICE_TIERS = ["auto", "default", "priority", "flex"] as const;
+const SERVICE_TIERS = ["auto", "default", "priority", "flex", "ultrafast"] as const;
 export type ServiceTierType = (typeof SERVICE_TIERS)[number];
+
+export const TRAFFIC_CLASSES = ["foreground", "opportunistic"] as const;
+export type TrafficClass = (typeof TRAFFIC_CLASSES)[number];
+export const TRANSPORT_POLICY_OVERRIDES = ["smart", "always_http", "always_websocket"] as const;
+export type TransportPolicyOverride = (typeof TRANSPORT_POLICY_OVERRIDES)[number];
+export const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export type ReasoningEffortType = (typeof REASONING_EFFORTS)[number];
+export const ENFORCED_REASONING_EFFORTS = ["none", ...REASONING_EFFORTS] as const;
 
 export const ApiKeySchema = z.object({
   id: z.string(),
   name: z.string(),
   keyPrefix: z.string(),
   allowedModels: z.array(z.string()).nullable(),
+  applyToCodexModel: z.boolean().default(false),
   enforcedModel: z.string().nullable().default(null),
-  enforcedReasoningEffort: z
-    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
-    .nullable()
-    .default(null),
+  allowedReasoningEfforts: z.array(z.enum(REASONING_EFFORTS)).nullable().default(null),
+  trafficClass: z
+    .enum(TRAFFIC_CLASSES)
+    .default("foreground"),
+  transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().default(null),
+  enforcedReasoningEffort: z.enum(ENFORCED_REASONING_EFFORTS).nullable().default(null),
   enforcedServiceTier: z
     .enum(SERVICE_TIERS)
     .nullable()
     .default(null),
-  expiresAt: z.string().datetime({ offset: true }).nullable(),
+  usageSections: z.string().default("upstream_limits,account_pool_usage"),
+  expiresAt: z.iso.datetime({ offset: true }).nullable(),
   isActive: z.boolean(),
   accountAssignmentScopeEnabled: z.boolean().default(false),
+  sourceAssignmentScopeEnabled: z.boolean().default(false),
   assignedAccountIds: z.array(z.string()).default([]),
-  createdAt: z.string().datetime({ offset: true }),
-  lastUsedAt: z.string().datetime({ offset: true }).nullable(),
+  assignedSourceIds: z.array(z.string()).default([]),
+  createdAt: z.iso.datetime({ offset: true }),
+  lastUsedAt: z.iso.datetime({ offset: true }).nullable(),
   limits: z.array(LimitRuleSchema).default([]),
   usageSummary: ApiKeyUsageSummarySchema.nullable().default(null),
+  pooledRemainingPercentPrimary: z.number().nullable().default(null),
+  pooledRemainingPercentSecondary: z.number().nullable().default(null),
+  pooledCapacityCreditsPrimary: z.number().default(0),
 });
+
+export const USAGE_SECTIONS = ["upstream_limits", "account_pool_usage"] as const;
+export type UsageSection = (typeof USAGE_SECTIONS)[number];
+
+export const USAGE_SECTION_LABELS: Record<UsageSection, string> = {
+  upstream_limits: "Upstream limits",
+  account_pool_usage: "Account pool usage",
+};
 
 export const ApiKeyCreateRequestSchema = z.object({
   name: z.string().min(1).max(128),
   allowedModels: z.array(z.string()).optional(),
+  applyToCodexModel: z.boolean().optional(),
+  trafficClass: z.enum(TRAFFIC_CLASSES).optional(),
+  transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
-  enforcedReasoningEffort: z
-    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
-    .nullable()
-    .optional(),
+  allowedReasoningEfforts: z.array(z.enum(REASONING_EFFORTS)).min(1).nullable().optional(),
+  enforcedReasoningEffort: z.enum(ENFORCED_REASONING_EFFORTS).nullable().optional(),
   enforcedServiceTier: z
     .enum(SERVICE_TIERS)
     .nullable()
     .optional(),
+  usageSections: z.string().optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
-  expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
+  expiresAt: z.iso.datetime({ offset: true }).nullable().optional(),
+  assignedAccountIds: z.array(z.string()).optional(),
+  assignedSourceIds: z.array(z.string()).optional(),
   limits: z.array(LimitRuleCreateSchema).optional(),
 });
 
@@ -81,19 +110,22 @@ export const ApiKeyCreateResponseSchema = ApiKeySchema.extend({
 export const ApiKeyUpdateRequestSchema = z.object({
   name: z.string().min(1).max(128).optional(),
   allowedModels: z.array(z.string()).nullable().optional(),
+  applyToCodexModel: z.boolean().optional(),
+  trafficClass: z.enum(TRAFFIC_CLASSES).optional(),
+  transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
-  enforcedReasoningEffort: z
-    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
-    .nullable()
-    .optional(),
+  allowedReasoningEfforts: z.array(z.enum(REASONING_EFFORTS)).min(1).nullable().optional(),
+  enforcedReasoningEffort: z.enum(ENFORCED_REASONING_EFFORTS).nullable().optional(),
   enforcedServiceTier: z
     .enum(SERVICE_TIERS)
     .nullable()
     .optional(),
+  usageSections: z.string().optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
-  expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
+  expiresAt: z.iso.datetime({ offset: true }).nullable().optional(),
   isActive: z.boolean().optional(),
   assignedAccountIds: z.array(z.string()).optional(),
+  assignedSourceIds: z.array(z.string()).optional(),
   limits: z.array(LimitRuleCreateSchema).optional(),
   resetUsage: z.boolean().optional(),
 });
@@ -107,6 +139,12 @@ export type ApiKeyCreateRequest = z.infer<typeof ApiKeyCreateRequestSchema>;
 export type ApiKeyCreateResponse = z.infer<typeof ApiKeyCreateResponseSchema>;
 export type ApiKeyUpdateRequest = z.infer<typeof ApiKeyUpdateRequestSchema>;
 
-export const ModelItemSchema = z.object({ id: z.string(), name: z.string() });
+export const ModelItemSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  sourceOnly: z.boolean().default(false),
+  supportedReasoningEfforts: z.array(z.enum(REASONING_EFFORTS)).default([]),
+  defaultReasoningEffort: z.enum(REASONING_EFFORTS).nullable().optional(),
+});
 export const ModelsResponseSchema = z.object({ models: z.array(ModelItemSchema) });
 export type ModelItem = z.infer<typeof ModelItemSchema>;

@@ -6,24 +6,40 @@ import { createApiKey } from "@/test/mocks/factories";
 import { ApiKeyInfo } from "./api-key-info";
 
 describe("ApiKeyInfo", () => {
-	it("renders prefix, allowed models, and enforcement metadata", () => {
+  it("renders prefix, allowed models, and enforcement metadata", () => {
 		render(
 			<ApiKeyInfo
 				apiKey={createApiKey({
 					keyPrefix: "sk-special",
 					allowedModels: ["gpt-5.1", "gpt-4o-mini"],
 					enforcedModel: "gpt-5.1",
-					enforcedReasoningEffort: "high",
+					enforcedReasoningEffort: null,
+					allowedReasoningEfforts: ["low", "high", "xhigh"],
 				})}
 			/>,
 		);
 
-		expect(screen.getByText("Key Details")).toBeInTheDocument();
-		expect(screen.getByText("sk-special")).toBeInTheDocument();
-		expect(screen.getByText("gpt-5.1, gpt-4o-mini")).toBeInTheDocument();
-		expect(screen.getByText("Enforced Model")).toBeInTheDocument();
-		expect(screen.getByText("Enforced Effort")).toBeInTheDocument();
-	});
+    expect(screen.getByText("Key Details")).toBeInTheDocument();
+    expect(screen.getByText("sk-special")).toBeInTheDocument();
+    expect(screen.getByText("gpt-5.1, gpt-4o-mini")).toBeInTheDocument();
+    expect(screen.getByText("Foreground")).toBeInTheDocument();
+    expect(screen.getByText("Enforced Model")).toBeInTheDocument();
+    expect(screen.getByText("Allowed efforts")).toBeInTheDocument();
+    expect(screen.getByText("Low, High, Extra high")).toBeInTheDocument();
+  });
+
+  it("renders opportunistic traffic class when set", () => {
+    render(
+      <ApiKeyInfo
+        apiKey={createApiKey({
+          trafficClass: "opportunistic",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Traffic class")).toBeInTheDocument();
+    expect(screen.getByText("Opportunistic")).toBeInTheDocument();
+  });
 
 	it("falls back to all models and never expiry when the key is unrestricted", () => {
 		render(

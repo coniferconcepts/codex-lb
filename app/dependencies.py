@@ -9,12 +9,15 @@ from fastapi import Depends, FastAPI, Request, WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_background_session, get_session
+from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.service import AccountsService
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeysService
 from app.modules.audit.repository import AuditRepository
 from app.modules.audit.service import AuditLogsService
+from app.modules.automations.repository import AutomationsRepository
+from app.modules.automations.service import AutomationsService
 from app.modules.dashboard.repository import DashboardRepository
 from app.modules.dashboard.service import DashboardService
 from app.modules.dashboard_auth.repository import DashboardAuthRepository
@@ -25,10 +28,17 @@ from app.modules.dashboard_auth.service import (
 )
 from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
+from app.modules.limit_warmup.repository import LimitWarmupRepository
+from app.modules.model_sources.repository import ModelSourcesRepository
+from app.modules.model_sources.service import ModelSourcesService
 from app.modules.oauth.service import OauthService
+from app.modules.proxy.capability_lineage_repository import CapabilityLineageRepository
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.service import ProxyService
 from app.modules.proxy.sticky_repository import StickySessionsRepository
+from app.modules.quota_planner.repository import QuotaPlannerRepository
+from app.modules.reports.repository import ReportsRepository
+from app.modules.reports.service import ReportsService
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.request_logs.service import RequestLogsService
 from app.modules.settings.repository import SettingsRepository
@@ -84,10 +94,23 @@ class ApiKeysContext:
 
 
 @dataclass(slots=True)
+class ModelSourcesContext:
+    session: AsyncSession
+    repository: ModelSourcesRepository
+    service: ModelSourcesService
+
+
+@dataclass(slots=True)
 class RequestLogsContext:
     session: AsyncSession
     repository: RequestLogsRepository
     service: RequestLogsService
+
+
+@dataclass(slots=True)
+class QuotaPlannerContext:
+    session: AsyncSession
+    repository: QuotaPlannerRepository
 
 
 @dataclass(slots=True)
@@ -119,13 +142,35 @@ class StickySessionsContext:
     service: StickySessionsService
 
 
+@dataclass(slots=True)
+class ReportsContext:
+    session: AsyncSession
+    repository: ReportsRepository
+    service: ReportsService
+
+
+@dataclass(slots=True)
+class AutomationsContext:
+    session: AsyncSession
+    repository: AutomationsRepository
+    accounts_repository: AccountsRepository
+    service: AutomationsService
+
+
 def get_accounts_context(
     session: AsyncSession = Depends(get_session),
 ) -> AccountsContext:
     repository = AccountsRepository(session)
     usage_repository = UsageRepository(session)
     additional_usage_repository = AdditionalUsageRepository(session)
-    service = AccountsService(repository, usage_repository, additional_usage_repository)
+    limit_warmup_repository = LimitWarmupRepository(session)
+    service = AccountsService(
+        repository,
+        usage_repository,
+        additional_usage_repository,
+        limit_warmup_repository,
+        auth_manager=AuthManager(repository, refresh_repo_factory=_accounts_repo_context),
+    )
     return AccountsContext(
         session=session,
         repository=repository,
@@ -175,6 +220,8 @@ async def _proxy_repo_context() -> AsyncIterator[ProxyRepositories]:
             sticky_sessions=StickySessionsRepository(session),
             api_keys=ApiKeysRepository(session),
             additional_usage=AdditionalUsageRepository(session),
+            quota_planner=QuotaPlannerRepository(session),
+            capability_lineage=CapabilityLineageRepository(session),
         )
 
 
@@ -216,8 +263,17 @@ def get_api_keys_context(
     session: AsyncSession = Depends(get_session),
 ) -> ApiKeysContext:
     repository = ApiKeysRepository(session)
-    service = ApiKeysService(repository)
+    usage_repository = UsageRepository(session)
+    service = ApiKeysService(repository, usage_repository=usage_repository)
     return ApiKeysContext(session=session, repository=repository, service=service)
+
+
+def get_model_sources_context(
+    session: AsyncSession = Depends(get_session),
+) -> ModelSourcesContext:
+    repository = ModelSourcesRepository(session)
+    service = ModelSourcesService(repository)
+    return ModelSourcesContext(session=session, repository=repository, service=service)
 
 
 def get_request_logs_context(
@@ -226,6 +282,13 @@ def get_request_logs_context(
     repository = RequestLogsRepository(session)
     service = RequestLogsService(repository)
     return RequestLogsContext(session=session, repository=repository, service=service)
+
+
+def get_quota_planner_context(
+    session: AsyncSession = Depends(get_session),
+) -> QuotaPlannerContext:
+    repository = QuotaPlannerRepository(session)
+    return QuotaPlannerContext(session=session, repository=repository)
 
 
 def get_settings_context(
@@ -262,5 +325,28 @@ def get_sticky_sessions_context(
         session=session,
         repository=repository,
         settings_repository=settings_repository,
+        service=service,
+    )
+
+
+def get_reports_context(
+    session: AsyncSession = Depends(get_session),
+) -> ReportsContext:
+    repository = ReportsRepository(session)
+    service = ReportsService(repository)
+    return ReportsContext(session=session, repository=repository, service=service)
+
+
+def get_automations_context(
+    session: AsyncSession = Depends(get_session),
+) -> AutomationsContext:
+    repository = AutomationsRepository(session)
+    accounts_repository = AccountsRepository(session)
+    request_logs_repository = RequestLogsRepository(session)
+    service = AutomationsService(repository, accounts_repository, request_logs_repository)
+    return AutomationsContext(
+        session=session,
+        repository=repository,
+        accounts_repository=accounts_repository,
         service=service,
     )

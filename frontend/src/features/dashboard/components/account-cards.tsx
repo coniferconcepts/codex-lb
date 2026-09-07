@@ -1,30 +1,37 @@
-import { useMemo } from "react";
 import { Users } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 
 import { EmptyState } from "@/components/empty-state";
+import { Button } from "@/components/ui/button";
 import { AccountCard, type AccountCardProps } from "@/features/dashboard/components/account-card";
 import type { AccountSummary } from "@/features/dashboard/schemas";
-import { buildDuplicateAccountIdSet } from "@/utils/account-identifiers";
 
 const ACCOUNT_CARD_VISIBLE_ROWS = 2;
 // Account cards can grow when the optional email row is rendered.
-const ACCOUNT_CARD_ROW_HEIGHT_REM = 12.5;
+const ACCOUNT_CARD_ROW_HEIGHT_REM = 11.5;
 const ACCOUNT_CARD_ROW_GAP_REM = 1;
 
 export type AccountCardsProps = {
   accounts: AccountSummary[];
+  readOnly?: boolean;
   onAction?: AccountCardProps["onAction"];
 };
 
-export function AccountCards({ accounts, onAction }: AccountCardsProps) {
-  const duplicateAccountIds = useMemo(() => buildDuplicateAccountIdSet(accounts), [accounts]);
+export function AccountCards({ accounts, readOnly = false, onAction }: AccountCardsProps) {
+  const { t } = useTranslation();
 
   if (accounts.length === 0) {
     return (
       <EmptyState
         icon={Users}
-        title="No accounts connected yet"
-        description="Import or authenticate an account to get started."
+        title={t("dashboard.accounts.emptyTitle")}
+        description={t("dashboard.accounts.emptyDescription")}
+        action={
+          <Button asChild size="sm">
+            <Link to="/accounts">{t("dashboard.accounts.emptyAction")}</Link>
+          </Button>
+        }
       />
     );
   }
@@ -41,7 +48,8 @@ export function AccountCards({ accounts, onAction }: AccountCardsProps) {
         <div key={account.accountId} className="animate-fade-in-up" style={{ animationDelay: `${index * 75}ms` }}>
           <AccountCard
             account={account}
-            showAccountId={duplicateAccountIds.has(account.accountId)}
+            showAccountId={account.isEmailDuplicate === true}
+            readOnly={readOnly}
             onAction={onAction}
           />
         </div>

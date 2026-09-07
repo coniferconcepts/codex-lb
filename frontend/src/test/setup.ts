@@ -1,7 +1,10 @@
+import "@/test/setup-local-storage";
 import "@testing-library/jest-dom/vitest";
 import { cleanup, configure } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, vi } from "vitest";
 
+import "@/i18n";
+import { LANGUAGE_STORAGE_KEY } from "@/i18n";
 import { resetMockState } from "@/test/mocks/handlers";
 import { server, startMockServer } from "@/test/mocks/server";
 
@@ -25,6 +28,34 @@ if (typeof document !== "undefined" && typeof document.elementFromPoint !== "fun
   document.elementFromPoint = () => null;
 }
 
+if (typeof Element !== "undefined") {
+  const proto = Element.prototype as unknown as Record<string, unknown>;
+  if (typeof proto.hasPointerCapture !== "function") {
+    Object.defineProperty(Element.prototype, "hasPointerCapture", {
+      configurable: true,
+      value: () => false,
+    });
+  }
+  if (typeof proto.setPointerCapture !== "function") {
+    Object.defineProperty(Element.prototype, "setPointerCapture", {
+      configurable: true,
+      value: () => {},
+    });
+  }
+  if (typeof proto.releasePointerCapture !== "function") {
+    Object.defineProperty(Element.prototype, "releasePointerCapture", {
+      configurable: true,
+      value: () => {},
+    });
+  }
+  if (typeof proto.scrollIntoView !== "function") {
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      configurable: true,
+      value: () => {},
+    });
+  }
+}
+
 if (typeof globalThis.ResizeObserver === "undefined") {
   class ResizeObserverMock {
     observe() {}
@@ -42,6 +73,11 @@ beforeAll(() => {
 afterEach(() => {
   if (typeof window !== "undefined") {
     window.history.replaceState({}, "", "/");
+    try {
+      window.localStorage.removeItem(LANGUAGE_STORAGE_KEY);
+    } catch {
+      /* ignore */
+    }
   }
   resetMockState();
   server.resetHandlers();

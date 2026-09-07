@@ -122,6 +122,7 @@ ChatCompletionResult = ChatCompletion | OpenAIErrorEnvelope
 class ToolCallIndex:
     indexes: dict[str, int] = field(default_factory=dict)
     next_index: int = 0
+    output_index_map: dict[int, int] = field(default_factory=dict)
 
     def index_for(self, call_id: str | None, name: str | None) -> int:
         key = _tool_call_key(call_id, name)
@@ -131,6 +132,51 @@ class ToolCallIndex:
             self.indexes[key] = self.next_index
             self.next_index += 1
         return self.indexes[key]
+
+    def index_for_output_index(self, output_index: int | None, call_id: str | None, name: str | None) -> int:
+        """Resolve tool call index, preferring output_index mapping when available.
+
+        Always records the resolved index against every routing key that is
+        present (``output_index``, ``call_id``/``name``) so a later event for
+        the same logical tool call that only carries one of those identifiers
+        does not get assigned a new slot. Without this, a stream that first
+        routes by ``item_id`` + ``output_index`` and later emits a
+        ``call_id``-only event without ``output_index`` (e.g. legacy delta
+        formats) would split one tool call into two ``tool_calls[]`` slots and
+        reintroduce the duplication this change fixes.
+        """
+        key = _tool_call_key(call_id, name)
+        if output_index is not None and output_index in self.output_index_map:
+            idx = self.output_index_map[output_index]
+            if key is not None and key not in self.indexes:
+                self.indexes[key] = idx
+            return idx
+        if key is None:
+            if output_index is not None:
+                idx = self.output_index_map.get(output_index, self.next_index)
+                if output_index not in self.output_index_map:
+                    self.output_index_map[output_index] = idx
+                    self.next_index = max(self.next_index, idx + 1)
+                return idx
+            return 0
+        if key not in self.indexes:
+            self.indexes[key] = self.next_index
+            self.next_index += 1
+        idx = self.indexes[key]
+        if output_index is not None and output_index not in self.output_index_map:
+            self.output_index_map[output_index] = idx
+        return idx
+
+    def register_alias(self, alias_id: str, index: int) -> None:
+        """Register an additional ID that maps to the same index."""
+        key = f"id:{alias_id}"
+        if key not in self.indexes:
+            self.indexes[key] = index
+
+    def register_output_index(self, output_index: int, index: int) -> None:
+        """Map a Responses API output_index to a tool call index."""
+        if output_index not in self.output_index_map:
+            self.output_index_map[output_index] = index
 
 
 @dataclass
@@ -307,17 +353,19 @@ def iter_chat_chunks(
                 response = payload.get("response")
                 if isinstance(response, dict):
                     maybe_error = response.get("error")
-                    if isinstance(maybe_error, dict):
+                    if isinstance(maybe_error, dict) and maybe_error:
                         error = maybe_error
             else:
                 maybe_error = payload.get("error")
-                if isinstance(maybe_error, dict):
+                if isinstance(maybe_error, dict) and maybe_error:
                     error = maybe_error
             if error is not None:
                 error_payload: dict[str, JsonValue] = {"error": error}
-                yield _dump_sse(error_payload)
-                yield "data: [DONE]\n\n"
-                return
+            else:
+                error_payload = _default_error_envelope().model_dump(mode="json", exclude_none=True)
+            yield _dump_sse(error_payload)
+            yield "data: [DONE]\n\n"
+            return
         if event_type in ("response.completed", "response.incomplete"):
             for tool_state in state.tool_calls:
                 stream_delta = tool_state.build_stream_delta()
@@ -402,6 +450,9 @@ async def stream_chat_chunks(
             if chunk.strip() == "data: [DONE]":
                 terminal_chunk_sent = True
                 break
+    if not terminal_chunk_sent:
+        yield _dump_sse(_upstream_stream_truncated_error_payload())
+        yield "data: [DONE]\n\n"
 
 
 async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> ChatCompletionResult:
@@ -413,6 +464,8 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
     incomplete_reason: str | None = None
     tool_index = ToolCallIndex()
     tool_calls: list[ToolCallState] = []
+    terminal_error: ChatCompletionResult | None = None
+    terminal_event_seen = False
 
     async for line in stream:
         payload = _parse_data(line)
@@ -431,6 +484,8 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
         if tool_delta is not None:
             _merge_tool_call_delta(tool_calls, tool_delta)
         if event_type in ("response.failed", "error"):
+            if terminal_error is not None:
+                continue
             error = None
             if event_type == "response.failed":
                 response = payload.get("response")
@@ -442,10 +497,12 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
                 maybe_error = payload.get("error")
                 if isinstance(maybe_error, dict):
                     error = maybe_error
-            if error is not None:
-                return _error_envelope_from_payload(error)
-            return _default_error_envelope()
+            terminal_error = _error_envelope_from_payload(error) if error is not None else _default_error_envelope()
+            continue
+        if terminal_error is not None:
+            continue
         if event_type in ("response.completed", "response.incomplete"):
+            terminal_event_seen = True
             response = payload.get("response")
             if isinstance(response, dict):
                 response_id_value = response.get("id")
@@ -454,6 +511,11 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
                 usage = _parse_usage(response.get("usage"))
                 if event_type == "response.incomplete":
                     incomplete_reason = _finish_reason_from_incomplete(response)
+
+    if terminal_error is not None:
+        return terminal_error
+    if not terminal_event_seen:
+        return _upstream_stream_truncated_error()
 
     message_content: str | None = "".join(content_parts)
     message_refusal = "".join(refusal_parts) or None
@@ -529,6 +591,20 @@ def _dump_sse(payload: dict[str, JsonValue]) -> str:
     return format_sse_data(payload)
 
 
+def _upstream_stream_truncated_error_payload() -> dict[str, JsonValue]:
+    return {
+        "error": {
+            "message": "Responses stream ended before a terminal event",
+            "type": "server_error",
+            "code": "upstream_stream_truncated",
+        }
+    }
+
+
+def _upstream_stream_truncated_error() -> OpenAIErrorEnvelope:
+    return OpenAIErrorEnvelope.model_validate(_upstream_stream_truncated_error_payload())
+
+
 def _finish_reason_from_incomplete(response: JsonValue | None) -> str:
     response_mapping = _as_mapping(response)
     if response_mapping is None:
@@ -589,6 +665,38 @@ def _coerce_number(value: JsonValue) -> int | float | None:
     return None
 
 
+def _resolve_output_index(payload: Mapping[str, JsonValue]) -> int | None:
+    """Extract output_index from a Responses API event payload."""
+    val = payload.get("output_index")
+    if isinstance(val, int):
+        return val
+    return None
+
+
+def _register_item_id_alias(payload: Mapping[str, JsonValue], index: int, indexer: ToolCallIndex) -> None:
+    """Register item.id from output_item events as an index alias.
+
+    The Responses API emits output_item.added/done events with item.id
+    (e.g. "fc_01ee...") and item.call_id (e.g. "call_kI8y...").
+    Subsequent function_call_arguments.delta/done events reference the
+    tool call via item_id (= item.id), not call_id.  By registering
+    item.id as an alias when we first see the output_item event, later
+    delta/done events can resolve to the correct index.
+    """
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return
+    item_id = item.get("id")
+    call_id = item.get("call_id")
+    if isinstance(item_id, str) and item_id:
+        if item_id != call_id:
+            indexer.register_alias(item_id, index)
+
+    output_index = _resolve_output_index(payload)
+    if output_index is not None:
+        indexer.register_output_index(output_index, index)
+
+
 def _tool_call_delta_from_payload(payload: Mapping[str, JsonValue], indexer: ToolCallIndex) -> ToolCallDelta | None:
     if not _is_tool_call_event(payload):
         return None
@@ -596,7 +704,16 @@ def _tool_call_delta_from_payload(payload: Mapping[str, JsonValue], indexer: Too
     if fields is None:
         return None
     call_id, name, arguments, tool_type = fields
-    index = indexer.index_for(call_id, name)
+    output_index = _resolve_output_index(payload)
+    routing_id = call_id
+    if routing_id is None:
+        item = payload.get("item")
+        routing_id = _first_str(
+            payload.get("item_id"),
+            item.get("id") if isinstance(item, dict) else None,
+        )
+    index = indexer.index_for_output_index(output_index, routing_id, name)
+    _register_item_id_alias(payload, index, indexer)
     return ToolCallDelta(
         index=index,
         call_id=call_id,

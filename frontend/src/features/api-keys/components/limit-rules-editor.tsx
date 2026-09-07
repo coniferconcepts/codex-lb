@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Plus } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,6 +23,11 @@ function makeDefaultRule(): LimitRuleCreate {
 }
 
 export function LimitRulesEditor({ rules, onChange }: LimitRulesEditorProps) {
+  const { t } = useTranslation();
+  const [ruleKeys, setRuleKeys] = useState(() =>
+    rules.map((_, index) => `limit-rule-${index}`),
+  );
+  const [nextRuleKey, setNextRuleKey] = useState(() => rules.length);
   const [advanced, setAdvanced] = useState(() => {
     if (rules.length === 0) return false;
     // If any non-standard rule exists, start in advanced mode
@@ -77,6 +83,8 @@ export function LimitRulesEditor({ rules, onChange }: LimitRulesEditorProps) {
   };
 
   const addRule = () => {
+    setRuleKeys([...ruleKeys, `limit-rule-${nextRuleKey}`]);
+    setNextRuleKey(nextRuleKey + 1);
     onChange([...rules, makeDefaultRule()]);
   };
 
@@ -87,15 +95,16 @@ export function LimitRulesEditor({ rules, onChange }: LimitRulesEditorProps) {
   };
 
   const removeRule = (index: number) => {
+    setRuleKeys(ruleKeys.filter((_, i) => i !== index));
     onChange(rules.filter((_, i) => i !== index));
   };
 
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <span className="text-sm font-medium">Limits</span>
+        <span className="text-sm font-medium">{t("apiKeys.form.limits")}</span>
         <div className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground">Advanced</span>
+          <span className="text-xs text-muted-foreground">{t("apiKeys.limitRules.advanced")}</span>
           <Switch
             checked={advanced}
             onCheckedChange={setAdvanced}
@@ -106,18 +115,20 @@ export function LimitRulesEditor({ rules, onChange }: LimitRulesEditorProps) {
       {!advanced ? (
         <div className="space-y-2">
           <div>
-            <label className="text-xs text-muted-foreground">Weekly token limit</label>
+            <label htmlFor="weekly-token-limit" className="text-xs text-muted-foreground">{t("apiKeys.limitRules.weeklyTokenLimit")}</label>
             <Input
+              id="weekly-token-limit"
               type="number"
               min={1}
               value={weeklyTokenRule ? String(weeklyTokenRule.maxValue) : ""}
               onChange={(e) => handleBasicTokenChange(e.target.value)}
-              placeholder="No limit"
+              placeholder={t("apiKeys.limitRules.noLimit")}
             />
           </div>
           <div>
-            <label className="text-xs text-muted-foreground">Weekly cost limit ($)</label>
+            <label htmlFor="weekly-cost-limit" className="text-xs text-muted-foreground">{t("apiKeys.limitRules.weeklyCostLimit")}</label>
             <Input
+              id="weekly-cost-limit"
               type="number"
               min={0.01}
               step={0.01}
@@ -127,7 +138,7 @@ export function LimitRulesEditor({ rules, onChange }: LimitRulesEditorProps) {
                   : ""
               }
               onChange={(e) => handleBasicCostChange(e.target.value)}
-              placeholder="No limit"
+              placeholder={t("apiKeys.limitRules.noLimit")}
             />
           </div>
         </div>
@@ -135,7 +146,7 @@ export function LimitRulesEditor({ rules, onChange }: LimitRulesEditorProps) {
         <div className="space-y-2">
           {rules.map((rule, index) => (
             <LimitRuleCard
-              key={index}
+              key={ruleKeys[index] ?? `limit-rule-${index}`}
               rule={rule}
               onChange={(updated) => updateRule(index, updated)}
               onRemove={() => removeRule(index)}
@@ -149,11 +160,11 @@ export function LimitRulesEditor({ rules, onChange }: LimitRulesEditorProps) {
             onClick={addRule}
           >
             <Plus className="mr-1 size-3.5" />
-            Add limit rule
+            {t("apiKeys.limitRules.addRule")}
           </Button>
           {rules.length > 1 ? (
             <p className="text-xs text-muted-foreground">
-              All rules are applied together (AND). A request is blocked if any limit is exceeded.
+              {t("apiKeys.limitRules.andHint")}
             </p>
           ) : null}
         </div>

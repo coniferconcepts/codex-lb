@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Cell, Pie, PieChart, Sector, type PieSectorShapeProps } from "recharts";
+import { useTranslation } from "react-i18next";
+import { Cell, Pie, PieChart, Sector, type PieSectorShapeProps } from "@/components/lazy-recharts";
 
 import { buildDonutPalette } from "@/utils/colors";
-import { formatCompactNumber } from "@/utils/formatters";
+import { formatCompactNumber, formatNumber } from "@/utils/formatters";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { useThemeStore } from "@/hooks/use-theme";
@@ -26,6 +27,16 @@ export type DonutChartProps = {
   title: string;
   subtitle?: string;
   safeLine?: { safePercent: number; riskLevel: "safe" | "warning" | "danger" | "critical" } | null;
+  /**
+   * Layout for the donut center label/value pair.
+   *
+   * - "remaining" (default): renders a "Remaining" caption above a single
+   *   compact-formatted number. Backwards-compatible behavior.
+   * - "credits": renders a "Credits" caption above a raw `remaining/total`
+   *   fraction. Used by the dashboard usage donuts so operators can read
+   *   the absolute credit counts without abbreviation (#371).
+   */
+  centerLayout?: "remaining" | "credits";
 };
 
 function SafeLineTick({
@@ -97,7 +108,8 @@ function formatUsedPercent(percent: number): string {
   return `${percent.toLocaleString("en-US", { maximumFractionDigits })}%`;
 }
 
-export function DonutChart({ items, total, centerValue, title, subtitle, safeLine }: DonutChartProps) {
+export function DonutChart({ items, total, centerValue, title, subtitle, safeLine, centerLayout = "remaining" }: DonutChartProps) {
+  const { t } = useTranslation();
   const isDark = useThemeStore((s) => s.theme === "dark");
   const blurred = usePrivacyStore((s) => s.blurred);
   const reducedMotion = useReducedMotion();
@@ -105,10 +117,12 @@ export function DonutChart({ items, total, centerValue, title, subtitle, safeLin
   const legendRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const consumedColor = isDark ? "#404040" : "#d3d3d3";
   const palette = buildDonutPalette(items.length, isDark);
-  const normalizedItems = items.map((item, index) => ({
-    ...item,
-    color: item.color ?? palette[index % palette.length],
-  }));
+  const normalizedItems = items
+    .map((item, index) => ({
+      ...item,
+      color: item.color ?? palette[index % palette.length],
+    }))
+    .sort((a, b) => b.value - a.value);
 
   const usedSum = normalizedItems.reduce((acc, item) => acc + Math.max(0, item.value), 0);
   const safeCapacity = Math.max(0, total);
@@ -183,9 +197,10 @@ export function DonutChart({ items, total, centerValue, title, subtitle, safeLin
                 isAnimationActive={!reducedMotion}
                 animationDuration={600}
                 animationEasing="ease-out"
-                onMouseEnter={(data) => {
-                  if (typeof data?.id === "string") {
-                    setActiveLegendId(data.id);
+                onMouseEnter={(data: { payload?: DonutDatum }) => {
+                  const datum = data.payload as DonutDatum | undefined;
+                  if (typeof datum?.id === "string") {
+                    setActiveLegendId(datum.id);
                   }
                 }}
                 onMouseLeave={() => setActiveLegendId(null)}
@@ -211,13 +226,37 @@ export function DonutChart({ items, total, centerValue, title, subtitle, safeLin
           ) : null}
           <div className="absolute inset-[22px] flex items-center justify-center rounded-full text-center pointer-events-none">
              <div>
-               <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Remaining</p>
-               <p className="text-base font-semibold tabular-nums">{formatCompactNumber(displayTotal)}</p>
+               {centerLayout === "credits" ? (
+                 <>
+                   <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{t("components.donut.credits")}</p>
+                   <p
+                     className="text-sm font-semibold tabular-nums leading-tight"
+                     data-testid="donut-center-remaining"
+                   >
+                     {formatNumber(displayTotal)}
+                   </p>
+                   <div className="-mx-1 my-0.5 border-t border-current opacity-20" />
+                   <p
+                     className="text-xs tabular-nums text-muted-foreground leading-tight"
+                     data-testid="donut-center-capacity"
+                   >
+                     {formatNumber(safeCapacity)}
+                   </p>
+                 </>
+               ) : (
+                 <>
+                   <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{t("components.donut.remaining")}</p>
+                   <p className="text-base font-semibold tabular-nums">{formatCompactNumber(displayTotal)}</p>
+                 </>
+               )}
             </div>
           </div>
           </div>
           <p className="text-[11px] tabular-nums text-muted-foreground" data-testid="donut-caption">
-            Total {formatCompactNumber(safeCapacity)} · {formatUsedPercent(usedPercent)} used
+            {t("components.donut.caption", {
+              total: formatCompactNumber(safeCapacity),
+              used: formatUsedPercent(usedPercent),
+            })}
           </p>
         </div>
 
@@ -284,7 +323,7 @@ export function DonutChart({ items, total, centerValue, title, subtitle, safeLin
                 className="h-2.5 w-2.5 shrink-0 rounded-full"
                 style={{ backgroundColor: consumedColor }}
               />
-              <span className="truncate font-medium">Used</span>
+              <span className="truncate font-medium">{t("components.donut.used")}</span>
             </div>
             <span className="tabular-nums text-muted-foreground" data-testid="donut-used-value">
               {formatCompactNumber(consumed)}

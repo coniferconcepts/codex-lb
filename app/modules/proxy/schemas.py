@@ -1,15 +1,36 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from datetime import datetime
+from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.core.clients.files import OPENAI_FILE_UPLOAD_LIMIT_BYTES, OPENAI_FILE_USE_CASE
 from app.core.types import JsonValue
 from app.modules.proxy.types import (
     AdditionalRateLimitData,
     CreditStatusDetailsData,
+    RateLimitResetCreditsData,
     RateLimitStatusDetailsData,
     RateLimitStatusPayloadData,
     RateLimitWindowSnapshotData,
 )
+
+
+class FileCreateRequest(BaseModel):
+    """Inbound payload for ``POST /backend-api/files``.
+
+    Mirrors upstream ChatGPT ``/backend-api/files`` registration body. The
+    proxy enforces the upstream-side ``OPENAI_FILE_UPLOAD_LIMIT_BYTES``
+    (512 MiB) at the edge so a misbehaving client does not allocate an
+    oversized SAS upload URL on a shared account.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    file_name: str = Field(min_length=1)
+    file_size: int = Field(gt=0, le=OPENAI_FILE_UPLOAD_LIMIT_BYTES)
+    use_case: str = Field(default=OPENAI_FILE_USE_CASE, min_length=1)
 
 
 class RateLimitWindowSnapshot(BaseModel):
@@ -37,6 +58,7 @@ class RateLimitStatusDetails(BaseModel):
     limit_reached: bool
     primary_window: RateLimitWindowSnapshot | None = None
     secondary_window: RateLimitWindowSnapshot | None = None
+    monthly_window: RateLimitWindowSnapshot | None = None
 
     @classmethod
     def from_data(cls, data: RateLimitStatusDetailsData) -> "RateLimitStatusDetails":
@@ -47,6 +69,7 @@ class RateLimitStatusDetails(BaseModel):
             secondary_window=RateLimitWindowSnapshot.from_data(data.secondary_window)
             if data.secondary_window
             else None,
+            monthly_window=RateLimitWindowSnapshot.from_data(data.monthly_window) if data.monthly_window else None,
         )
 
 
@@ -90,12 +113,23 @@ class AdditionalRateLimitStatus(BaseModel):
         )
 
 
+class RateLimitResetCredits(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    available_count: int
+
+    @classmethod
+    def from_data(cls, data: RateLimitResetCreditsData) -> "RateLimitResetCredits":
+        return cls(available_count=data.available_count)
+
+
 class RateLimitStatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     plan_type: str
     rate_limit: RateLimitStatusDetails | None = None
     credits: CreditStatusDetails | None = None
+    rate_limit_reset_credits: RateLimitResetCredits | None = None
     additional_rate_limits: list[AdditionalRateLimitStatus] = []
 
     @classmethod
@@ -104,8 +138,26 @@ class RateLimitStatusPayload(BaseModel):
             plan_type=data.plan_type,
             rate_limit=RateLimitStatusDetails.from_data(data.rate_limit) if data.rate_limit else None,
             credits=CreditStatusDetails.from_data(data.credits) if data.credits else None,
+            rate_limit_reset_credits=(
+                RateLimitResetCredits.from_data(data.rate_limit_reset_credits)
+                if data.rate_limit_reset_credits
+                else None
+            ),
             additional_rate_limits=[AdditionalRateLimitStatus.from_data(arl) for arl in data.additional_rate_limits],
         )
+
+
+class ConsumeRateLimitResetCreditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    redeem_request_id: str
+
+
+class ConsumeRateLimitResetCreditResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    code: str
+    windows_reset: int = 0
 
 
 class ReasoningLevelSchema(BaseModel):
@@ -113,6 +165,13 @@ class ReasoningLevelSchema(BaseModel):
 
     effort: str
     description: str
+
+
+class CodexTruncationPolicy(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mode: Literal["bytes", "tokens"]
+    limit: int = Field(strict=True, ge=-(2**63), le=2**63 - 1)
 
 
 class CodexModelEntry(BaseModel):
@@ -136,10 +195,8 @@ class CodexModelEntry(BaseModel):
     available_in_plans: list[str] = []
     prefer_websockets: bool = False
     visibility: str = "list"
-
-
-class CodexModelsResponse(BaseModel):
-    models: list[CodexModelEntry]
+    truncation_policy: CodexTruncationPolicy
+    experimental_supported_tools: list[str]
 
 
 class ModelMetadata(BaseModel):
@@ -148,6 +205,8 @@ class ModelMetadata(BaseModel):
     display_name: str
     description: str
     context_window: int
+    input_context_window: int | None = None
+    max_output_tokens: int | None = None
     input_modalities: list[str]
     supported_reasoning_levels: list[ReasoningLevelSchema]
     default_reasoning_level: str | None = None
@@ -159,10 +218,17 @@ class ModelMetadata(BaseModel):
     supported_in_api: bool = True
     minimal_client_version: str | None = None
     priority: int = 0
+    additional_speed_tiers: list[str] | None = None
+    service_tiers: list[dict[str, JsonValue]] | None = None
+    default_service_tier: str | None = None
 
 
 class ModelListItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Cursor's local-provider discovery reads OpenAI-compatible /v1/models
+    # entries and preserves provider-specific model capability fields. Keep
+    # allowing those extras so clients can learn the model context window and
+    # trigger their own compaction instead of relying on provider-side failures.
+    model_config = ConfigDict(extra="allow")
 
     id: str
     object: str = "model"
@@ -178,6 +244,12 @@ class ModelListResponse(BaseModel):
     data: list[ModelListItem]
 
 
+class CodexModelsResponse(BaseModel):
+    models: list[CodexModelEntry]
+    object: str = "list"
+    data: list[ModelListItem] = []
+
+
 class V1UsageLimitResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -191,6 +263,13 @@ class V1UsageLimitResponse(BaseModel):
     source: str = "api_key_limit"
 
 
+class AccountPoolUsageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary: float | None = None
+    secondary: float | None = None
+
+
 class V1UsageResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -200,3 +279,67 @@ class V1UsageResponse(BaseModel):
     total_cost_usd: float
     limits: list[V1UsageLimitResponse]
     upstream_limits: list[V1UsageLimitResponse] = []
+    account_pool_usage: AccountPoolUsageResponse | None = None
+
+
+class V1ResetCreditEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: str
+    email: str
+    redeem_id: str
+    expired_at: datetime | None = Field(serialization_alias="expiredAt")
+
+
+class V1ResetCreditRedeemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: str
+    redeem_id: str
+
+
+class V1ResetCreditRedeemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    windows_reset: int
+    redeemed_at: datetime | None = None
+
+
+class WarmupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = "normal"
+
+
+class WarmupSubmittedAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: str
+    request_id: str
+    model: str
+
+
+class WarmupSkippedAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: str
+    reason: str
+
+
+class WarmupFailedAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: str
+    error_code: str
+    error_message: str
+
+
+class WarmupResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str
+    total_accounts: int
+    submitted: list[WarmupSubmittedAccount]
+    skipped: list[WarmupSkippedAccount]
+    failed: list[WarmupFailedAccount]

@@ -8,6 +8,8 @@ type RequestOptions = {
   headers?: HeadersInit;
   signal?: AbortSignal;
   credentials?: RequestCredentials;
+  cache?: RequestCache;
+  suppressUnauthorizedHandler?: boolean;
 };
 
 const JSON_CONTENT_TYPE = "application/json";
@@ -148,6 +150,7 @@ async function request<T>(
       headers,
       signal: options?.signal,
       credentials: options?.credentials ?? "same-origin",
+      cache: options?.cache,
     });
   } catch (error) {
     throw new ApiError({
@@ -158,7 +161,7 @@ async function request<T>(
     });
   }
 
-  if (response.status === 401) {
+  if (response.status === 401 && !options?.suppressUnauthorizedHandler) {
     unauthorizedHandler?.();
   }
 

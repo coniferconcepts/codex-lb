@@ -1,10 +1,24 @@
-import { del, get, post } from "@/lib/api-client";
+import { del, get, patch, post, put } from "@/lib/api-client";
 
 import {
   AccountActionResponseSchema,
+  AccountAliasRequestSchema,
+  AccountAliasResponseSchema,
+  AccountAuthExportResponseSchema,
   AccountImportResponseSchema,
+  AccountLimitWarmupUpdateRequestSchema,
+  AccountLimitWarmupUpdateResponseSchema,
+  AccountUpdateRequestSchema,
   AccountsResponseSchema,
+  AccountRoutingPolicyUpdateRequestSchema,
+  AccountRoutingPolicyUpdateResponseSchema,
+  AccountUsageResetConsumeRequestSchema,
+  AccountUsageResetConsumeResponseSchema,
+  AccountUsageResetCreditsResponseSchema,
   AccountTrendsResponseSchema,
+  AccountProbeRequestSchema,
+  AccountProbeResponseSchema,
+  ConsumeRateLimitResetCreditResponseSchema,
   ManualOauthCallbackRequestSchema,
   ManualOauthCallbackResponseSchema,
   OauthCompleteRequestSchema,
@@ -12,7 +26,12 @@ import {
   OauthStartRequestSchema,
   OauthStartResponseSchema,
   OauthStatusResponseSchema,
+  RateLimitResetCreditsSnapshotSchema,
   RuntimeConnectAddressResponseSchema,
+} from "@/features/accounts/schemas";
+import type {
+  AccountRoutingPolicy,
+  AccountUsageResetConsumeRequest,
 } from "@/features/accounts/schemas";
 
 const ACCOUNTS_BASE_PATH = "/api/accounts";
@@ -44,6 +63,45 @@ export function reactivateAccount(accountId: string) {
   );
 }
 
+export function setAccountAlias(accountId: string, alias: string | null) {
+  const validated = AccountAliasRequestSchema.parse({ alias });
+  return put(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/alias`,
+    AccountAliasResponseSchema,
+    { body: validated },
+  );
+}
+
+export function updateAccount(accountId: string, payload: unknown) {
+  const validated = AccountUpdateRequestSchema.parse(payload);
+  return patch(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`,
+    AccountActionResponseSchema,
+    { body: validated },
+  );
+}
+
+export function updateAccountLimitWarmup(accountId: string, enabled: boolean) {
+  const payload = AccountLimitWarmupUpdateRequestSchema.parse({ enabled });
+  return put(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/limit-warmup`,
+    AccountLimitWarmupUpdateResponseSchema,
+    { body: payload },
+  );
+}
+
+export function updateAccountRoutingPolicy(
+  accountId: string,
+  routingPolicy: AccountRoutingPolicy,
+) {
+  const payload = AccountRoutingPolicyUpdateRequestSchema.parse({ routingPolicy });
+  return put(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/routing-policy`,
+    AccountRoutingPolicyUpdateResponseSchema,
+    { body: payload },
+  );
+}
+
 export function getAccountTrends(accountId: string) {
   return get(
     `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/trends`,
@@ -51,9 +109,64 @@ export function getAccountTrends(accountId: string) {
   );
 }
 
-export function deleteAccount(accountId: string) {
+export function getAccountUsageResetCredits(accountId: string) {
+  return get(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/usage-reset-credits`,
+    AccountUsageResetCreditsResponseSchema,
+  );
+}
+
+export function consumeAccountUsageResetCredit(
+  accountId: string,
+  payload?: AccountUsageResetConsumeRequest,
+) {
+  const validated = payload === undefined ? undefined : AccountUsageResetConsumeRequestSchema.parse(payload);
+  return post(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/usage-reset-credits/consume`,
+    AccountUsageResetConsumeResponseSchema,
+    validated ? { body: validated } : undefined,
+  );
+}
+
+export function probeAccount(accountId: string, payload?: unknown) {
+  const validated = payload === undefined ? undefined : AccountProbeRequestSchema.parse(payload);
+  return post(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/probe`,
+    AccountProbeResponseSchema,
+    validated ? { body: validated } : undefined,
+  );
+}
+
+export function exportAccountAuth(accountId: string) {
+  return post(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/export/auth`,
+    AccountAuthExportResponseSchema,
+  );
+}
+
+export function getRateLimitResetCredits(accountId: string) {
+  return get(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/rate-limit-reset-credits`,
+    RateLimitResetCreditsSnapshotSchema.nullable(),
+  );
+}
+
+export function consumeRateLimitResetCredit(
+  accountId: string,
+  payload?: AccountUsageResetConsumeRequest,
+) {
+  const validated = payload === undefined ? undefined : AccountUsageResetConsumeRequestSchema.parse(payload);
+  return post(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/rate-limit-reset-credits/consume`,
+    ConsumeRateLimitResetCreditResponseSchema,
+    validated ? { body: validated } : undefined,
+  );
+}
+
+export function deleteAccount(accountId: string, deleteHistory = false) {
+  const qs = deleteHistory ? "?delete_history=true" : "";
   return del(
-    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`,
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}${qs}`,
     AccountActionResponseSchema,
   );
 }
@@ -65,8 +178,9 @@ export function startOauth(payload: unknown) {
   });
 }
 
-export function getOauthStatus() {
-  return get(`${OAUTH_BASE_PATH}/status`, OauthStatusResponseSchema);
+export function getOauthStatus(flowId?: string) {
+  const query = flowId ? `?flowId=${encodeURIComponent(flowId)}` : "";
+  return get(`${OAUTH_BASE_PATH}/status${query}`, OauthStatusResponseSchema);
 }
 
 export function completeOauth(payload?: unknown) {
@@ -75,6 +189,7 @@ export function completeOauth(payload?: unknown) {
     body: validated,
   });
 }
+
 export function submitManualOauthCallback(payload: unknown) {
   const validated = ManualOauthCallbackRequestSchema.parse(payload);
   return post(`${OAUTH_BASE_PATH}/manual-callback`, ManualOauthCallbackResponseSchema, {

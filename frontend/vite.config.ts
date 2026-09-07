@@ -9,6 +9,29 @@ import { defineConfig } from "vitest/config";
 const proxyTarget = process.env.API_PROXY_TARGET || "http://localhost:2455";
 const packageJson = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version?: string };
 const appVersion = packageJson.version ?? "0.0.0";
+const manualChunkPackages: Record<string, string[]> = {
+  "vendor-react": ["react", "react-dom", "react-router-dom"],
+  "vendor-query": ["@tanstack/react-query"],
+  // recharts is intentionally NOT a manual chunk: forcing it into one made
+  // the bundler hoist shared helper modules into that group, which turned
+  // the (lazy-only) 580 KB chart bundle into a static import of the entry
+  // chunk, modulepreloaded before first paint.
+  "vendor-ui": ["radix-ui"],
+};
+
+function manualChunks(id: string): string | undefined {
+  if (!id.includes("/node_modules/")) {
+    return undefined;
+  }
+
+  for (const [chunkName, packages] of Object.entries(manualChunkPackages)) {
+    if (packages.some((packageName) => id.includes(`/node_modules/${packageName}/`))) {
+      return chunkName;
+    }
+  }
+
+  return undefined;
+}
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -31,14 +54,10 @@ export default defineConfig({
   build: {
     outDir: "../app/static",
     emptyOutDir: true,
+    chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {
-        manualChunks: {
-          "vendor-react": ["react", "react-dom", "react-router-dom"],
-          "vendor-query": ["@tanstack/react-query"],
-          "vendor-charts": ["recharts"],
-          "vendor-ui": ["radix-ui"],
-        },
+        manualChunks,
       },
     },
   },
@@ -46,7 +65,7 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
-    exclude: ["screenshots/**", "node_modules/**"],
+    exclude: ["browser-smoke/**", "screenshots/**", "node_modules/**"],
     fileParallelism: false,
     testTimeout: 15_000,
     coverage: {

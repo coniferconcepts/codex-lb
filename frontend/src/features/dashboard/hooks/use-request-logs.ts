@@ -17,9 +17,22 @@ const DEFAULT_FILTER_STATE: FilterState = {
   apiKeyIds: [],
   modelOptions: [],
   statuses: [],
+  conversationId: null,
   limit: 25,
   offset: 0,
 };
+
+export function requestLogFiltersApplied(filters: FilterState): boolean {
+  return (
+    filters.search.trim() !== "" ||
+    filters.timeframe !== DEFAULT_FILTER_STATE.timeframe ||
+    filters.accountIds.length > 0 ||
+    filters.apiKeyIds.length > 0 ||
+    filters.modelOptions.length > 0 ||
+    filters.statuses.length > 0 ||
+    Boolean(filters.conversationId)
+  );
+}
 
 const REQUEST_LOG_PARAM_KEYS = [
   "search",
@@ -28,6 +41,7 @@ const REQUEST_LOG_PARAM_KEYS = [
   "apiKeyId",
   "modelOption",
   "status",
+  "conversationId",
   "limit",
   "offset",
 ] as const;
@@ -48,6 +62,7 @@ function parseFilterState(params: URLSearchParams): FilterState {
     apiKeyIds: params.getAll("apiKeyId"),
     modelOptions: params.getAll("modelOption"),
     statuses: params.getAll("status"),
+    conversationId: params.get("conversationId") || null,
     limit: parseNumber(params.get("limit"), DEFAULT_FILTER_STATE.limit),
     offset: parseNumber(params.get("offset"), DEFAULT_FILTER_STATE.offset),
   };
@@ -81,6 +96,9 @@ function writeFilterState(state: FilterState, base?: URLSearchParams): URLSearch
   for (const value of state.statuses) {
     params.append("status", value);
   }
+  if (state.conversationId) {
+    params.set("conversationId", state.conversationId);
+  }
   params.set("limit", String(state.limit));
   params.set("offset", String(state.offset));
   return params;
@@ -99,10 +117,16 @@ function timeframeToSinceIso(timeframe: FilterState["timeframe"]): string | unde
   return new Date(now - lookup[timeframe]).toISOString();
 }
 
-export function useRequestLogs() {
+export type UseRequestLogsOptions = {
+  enabled?: boolean;
+};
+
+export function useRequestLogs(options: UseRequestLogsOptions = {}) {
+  const enabled = options.enabled ?? true;
   const [searchParams, setSearchParams] = useSearchParams();
 
   const filters = useMemo(() => parseFilterState(searchParams), [searchParams]);
+  const filtersApplied = requestLogFiltersApplied(filters);
   const since = useMemo(() => timeframeToSinceIso(filters.timeframe), [filters.timeframe]);
   const listFilters = useMemo<RequestLogsListFilters>(
     () => ({
@@ -114,6 +138,7 @@ export function useRequestLogs() {
       statuses: filters.statuses,
       modelOptions: filters.modelOptions,
       since,
+      conversationId: filters.conversationId ?? undefined,
     }),
     [filters, since],
   );
@@ -127,22 +152,66 @@ export function useRequestLogs() {
     [filters.accountIds, filters.apiKeyIds, filters.modelOptions, since],
   );
 
-  const logsQuery = useQuery({
+  const {
+    data: logsResult,
+    error: logsError,
+    isFetching: logsIsFetching,
+    isLoading: logsIsLoading,
+    isPending: logsIsPending,
+    isPlaceholderData: logsIsPlaceholderData,
+    isSuccess: logsIsSuccess,
+    refetch: refetchLogs,
+  } = useQuery({
     queryKey: ["dashboard", "request-logs", listFilters],
-    queryFn: () => getRequestLogs(listFilters),
+    queryFn: async () => ({
+      page: await getRequestLogs(listFilters),
+      filtersApplied,
+    }),
+    enabled,
     refetchInterval: 30_000,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
     placeholderData: keepPreviousData,
   });
+  const logsData = logsResult?.page;
+  const emptyStateFiltersApplied =
+    filtersApplied || (logsIsPlaceholderData && Boolean(logsResult?.filtersApplied));
+  const logsQuery = {
+    data: logsData,
+    error: logsError,
+    isFetching: logsIsFetching,
+    isLoading: logsIsLoading,
+    isPending: logsIsPending,
+    isPlaceholderData: logsIsPlaceholderData,
+    isSuccess: logsIsSuccess,
+    refetch: refetchLogs,
+  };
 
-  const optionsQuery = useQuery({
+  const {
+    data: optionsData,
+    error: optionsError,
+    isFetching: optionsIsFetching,
+    isLoading: optionsIsLoading,
+    isPending: optionsIsPending,
+    isSuccess: optionsIsSuccess,
+    refetch: refetchOptions,
+  } = useQuery({
     queryKey: ["dashboard", "request-log-options", facetFilters],
     queryFn: () => getRequestLogOptions(facetFilters),
+    enabled,
     refetchInterval: 30_000,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
   });
+  const optionsQuery = {
+    data: optionsData,
+    error: optionsError,
+    isFetching: optionsIsFetching,
+    isLoading: optionsIsLoading,
+    isPending: optionsIsPending,
+    isSuccess: optionsIsSuccess,
+    refetch: refetchOptions,
+  };
 
   const updateFilters = (patch: Partial<FilterState>) => {
     const nextState: FilterState = {
@@ -156,6 +225,7 @@ export function useRequestLogs() {
     filters,
     listFilters,
     facetFilters,
+    emptyStateFiltersApplied,
     logsQuery,
     optionsQuery,
     updateFilters,

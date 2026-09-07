@@ -8,10 +8,47 @@ import pytest
 from app.core.runtime_logging import (
     JsonFormatter,
     UtcDefaultFormatter,
+    _error_log_field,
+    _redact_log_value,
     build_log_config,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_redact_log_value_masks_keyed_secrets_and_bearer_tokens():
+    value = "password=secret-token Authorization: Bearer abc.def api_key=abc123"
+
+    redacted = _redact_log_value(value)
+
+    assert redacted == "password=[REDACTED] Authorization: Bearer [REDACTED] api_key=[REDACTED]"
+
+
+def test_redact_log_value_masks_basic_authorization_credentials():
+    value = "Authorization: Basic dXNlcjpwYXNz, status=failed"
+
+    redacted = _redact_log_value(value)
+
+    assert redacted == "Authorization: [REDACTED], status=failed"
+
+
+def test_error_log_field_quotes_redacted_field_values():
+    value = "temporary failure status=200 request_id=req-1 api_key=abc123"
+
+    field = _error_log_field(value)
+
+    assert field == '"temporary failure status=200 request_id=req-1 api_key=[REDACTED]"'
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ('provider error {"api_key":"sk-secret"}', 'provider error {"api_key":"[REDACTED]"}'),
+        ('provider error {"authorization":"Basic dXNlcjpwYXNz"}', 'provider error {"authorization":"[REDACTED]"}'),
+    ],
+)
+def test_error_log_field_redacts_json_style_secrets(value, expected):
+    assert _error_log_field(value) == json.dumps(expected)
 
 
 @pytest.fixture
@@ -216,4 +253,19 @@ def test_build_log_config_uses_utc_access_formatter_when_text(monkeypatch):
     access_formatter = cast(dict, formatters.get("access", {}))
     assert access_formatter.get("()") == "app.core.runtime_logging.UtcAccessFormatter"
     # Restore
+    get_settings.cache_clear()
+
+
+def test_build_log_config_exposes_app_loggers_via_root_handler(monkeypatch):
+    from typing import cast
+
+    monkeypatch.setenv("CODEX_LB_LOG_FORMAT", "text")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+    config = build_log_config()
+    root_logger = cast(dict, config.get("root", {}))
+
+    assert root_logger.get("handlers") == ["default"]
+    assert root_logger.get("level") == "INFO"
     get_settings.cache_clear()

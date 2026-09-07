@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Iterator, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -14,7 +14,7 @@ from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.proxy import load_balancer as load_balancer_module
 from app.modules.proxy.load_balancer import LoadBalancer
 from app.modules.proxy.repo_bundle import ProxyRepositories
-from app.modules.proxy.sticky_repository import StickySessionsRepository
+from app.modules.proxy.sticky_repository import StickyOwnerLookup, StickySessionsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
@@ -73,6 +73,9 @@ class _StubStickyRepository:
     async def get_account_id(self, *args, **kwargs) -> str | None:
         return None
 
+    async def get_account_id_and_abandonment(self, *args, **kwargs) -> StickyOwnerLookup:
+        return StickyOwnerLookup(account_id=None, continuity_abandoned=False)
+
     async def upsert(self, *args, **kwargs):
         return None
 
@@ -125,7 +128,11 @@ async def test_health_ready_succeeds_when_degraded() -> None:
 
     set_degraded("all upstream accounts are unavailable")
     mock_session = AsyncMock()
-    mock_session.execute = AsyncMock()
+    mock_scalars = MagicMock()
+    mock_scalars.all.return_value = []
+    mock_result = MagicMock()
+    mock_result.scalars.return_value = mock_scalars
+    mock_session.execute = AsyncMock(return_value=mock_result)
 
     with patch("app.core.draining._draining", False), patch("app.modules.health.api.get_session") as mock_get_session:
 
@@ -143,6 +150,7 @@ async def test_health_ready_succeeds_when_degraded() -> None:
 async def test_model_registry_keeps_cached_models_when_refresh_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = ModelRegistry(ttl_seconds=60.0)
     await registry.update({"plus": [_model("cached-model")]})
+    cached_models = set(registry.get_models_with_fallback())
 
     def _raise_runtime_error(*args, **kwargs):
         raise RuntimeError("boom")
@@ -152,7 +160,8 @@ async def test_model_registry_keeps_cached_models_when_refresh_fails(monkeypatch
     with pytest.raises(RuntimeError, match="boom"):
         await registry.update({"pro": [_model("new-model")]})
 
-    assert set(registry.get_models_with_fallback()) == {"cached-model"}
+    assert "cached-model" in cached_models
+    assert set(registry.get_models_with_fallback()) == cached_models
 
 
 @pytest.mark.asyncio
@@ -190,6 +199,7 @@ async def test_load_balancer_clears_stale_degraded_state_for_typed_selection_err
                 accounts=[],
                 latest_primary={},
                 latest_secondary={},
+                latest_monthly={},
                 error_message="No accounts with a plan supporting model 'gpt-5.3-codex-spark'",
                 error_code=load_balancer_module.NO_PLAN_SUPPORT_FOR_MODEL,
             )

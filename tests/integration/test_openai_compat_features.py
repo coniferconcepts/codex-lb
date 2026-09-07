@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import cast
 
 import pytest
+from fastapi.responses import JSONResponse
 
+import app.modules.proxy.api as proxy_api_module
 import app.modules.proxy.service as proxy_module
+from app.core.openai.requests import ResponsesRequest
 
 pytestmark = pytest.mark.integration
 
@@ -73,7 +77,22 @@ async def test_v1_responses_forwards_input_file_url(async_client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_rejects_input_file_id(async_client):
+async def test_v1_responses_forwards_input_file_id(async_client, monkeypatch):
+    """`input_file.file_id` was previously rejected because uploads via
+    `POST /backend-api/files` were not supported. With the file upload
+    protocol in place, the proxy now forwards these references verbatim
+    so callers can attach pre-uploaded files (bypassing the 16 MiB
+    websocket ceiling on `/responses`)."""
+    await _import_account(async_client, "acc_input_file_id", "input-file-id@example.com")
+
+    seen: dict[str, object] = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_input_file_id")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
     payload = {
         "model": "gpt-5.2",
         "input": [
@@ -87,11 +106,9 @@ async def test_v1_responses_rejects_input_file_id(async_client):
         ],
     }
     resp = await async_client.post("/v1/responses", json=payload)
-    assert resp.status_code == 400
-    payload = resp.json()
-    assert payload["error"]["type"] == "invalid_request_error"
-    assert payload["error"]["message"] == "Invalid request payload"
-    assert payload["error"]["param"] == "input"
+    assert resp.status_code == 200
+    forwarded_input = cast(ResponsesRequest, seen["payload"]).input
+    assert forwarded_input == payload["input"]
 
 
 @pytest.mark.asyncio
@@ -232,6 +249,93 @@ async def test_v1_responses_preserves_prompt_cache_controls(async_client, monkey
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_downgrades_explicit_prompt_cache_for_subscription(async_client, monkeypatch):
+    await _import_account(async_client, "acc_prompt_cache_explicit", "prompt-cache-explicit@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload.to_payload()
+        yield _completed_event("resp_prompt_cache_explicit")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "stable prefix",
+                        "prompt_cache_breakpoint": {"mode": "explicit"},
+                    },
+                    {"type": "input_text", "text": "changing suffix"},
+                ],
+            }
+        ],
+        "prompt_cache_key": "explicit-thread",
+        "prompt_cache_options": {"mode": "explicit"},
+    }
+    resp = await async_client.post("/v1/responses", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.headers["x-codex-lb-prompt-cache-mode"] == "subscription-implicit"
+    forwarded = seen["payload"]
+    assert forwarded["prompt_cache_key"] == "explicit-thread"
+    assert "prompt_cache_options" not in forwarded
+    assert "prompt_cache_breakpoint" not in forwarded["input"][0]["content"][0]
+    assert forwarded["input"][0]["content"][0]["text"] == "stable prefix"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_preserves_explicit_prompt_cache_for_model_source(async_client, monkeypatch):
+    await _import_account(async_client, "acc_prompt_cache_source", "prompt-cache-source@example.com")
+
+    seen = {}
+    source = object()
+
+    async def fake_select(model, api_key, *, raw_model=None, require_streaming=False):
+        return source, model
+
+    async def fake_source_response(
+        request, payload, *, source, api_key, rate_limit_headers, pre_normalization_effort=None
+    ):
+        seen["payload"] = payload.model_dump_for_forwarding()
+        return JSONResponse({"id": "resp_prompt_cache_source", "status": "completed", "output": []})
+
+    monkeypatch.setattr(proxy_api_module, "_select_responses_model_source", fake_select)
+    monkeypatch.setattr(proxy_api_module, "_source_responses_response", fake_source_response)
+
+    payload = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "stable prefix",
+                        "prompt_cache_breakpoint": {"mode": "explicit"},
+                    }
+                ],
+            }
+        ],
+        "prompt_cache_key": "source-thread",
+        "prompt_cache_options": {"mode": "explicit"},
+    }
+    resp = await async_client.post("/v1/responses", json=payload)
+
+    assert resp.status_code == 200
+    assert "x-codex-lb-prompt-cache-mode" not in resp.headers
+    forwarded = seen["payload"]
+    assert forwarded["prompt_cache_options"] == {"mode": "explicit"}
+    assert forwarded["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert forwarded["prompt_cache_key"] == "source-thread"
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_normalizes_prompt_cache_aliases(async_client, monkeypatch):
     await _import_account(async_client, "acc_prompt_cache_alias", "prompt-cache-alias@example.com")
 
@@ -322,10 +426,11 @@ async def test_v1_responses_coerces_store_true_to_false(async_client):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("truncation", ["auto", "disabled"])
-async def test_v1_responses_rejects_truncation(async_client, truncation):
+async def test_v1_responses_accepts_truncation(async_client, truncation):
     payload = {"model": "gpt-5.2", "input": "hi", "truncation": truncation}
     resp = await async_client.post("/v1/responses", json=payload)
-    assert resp.status_code == 400
+    # 503 means it passed validation (no 400) but there are no upstream accounts in test
+    assert resp.status_code != 400
 
 
 @pytest.mark.asyncio
@@ -364,6 +469,29 @@ async def test_v1_responses_allows_web_search(async_client, monkeypatch, tool_ty
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_preserves_image_generation_builtin_tool(async_client, monkeypatch):
+    await _import_account(async_client, "acc_v1_image_gen", "v1-image-gen@example.com")
+
+    seen = {}
+    image_tool = {"type": "image_generation", "output_format": "png"}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_v1_image_generation")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    request_payload = {
+        "model": "gpt-5.2",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Draw?"}]}],
+        "tools": [image_tool],
+    }
+    resp = await async_client.post("/v1/responses", json=request_payload)
+    assert resp.status_code == 200
+    assert seen["payload"].tools == [image_tool]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool_type", ["web_search", "web_search_preview"])
 async def test_backend_responses_allows_web_search(async_client, monkeypatch, tool_type):
     await _import_account(async_client, "acc_backend_web_search", "backend-web-search@example.com")
@@ -385,6 +513,88 @@ async def test_backend_responses_allows_web_search(async_client, monkeypatch, to
     resp = await async_client.post("/backend-api/codex/responses", json=request_payload)
     assert resp.status_code == 200
     assert seen["payload"].tools == [{"type": "web_search"}]
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_preserves_image_generation_tool_advertisement(async_client, monkeypatch):
+    await _import_account(async_client, "acc_backend_image_gen", "backend-image-gen@example.com")
+
+    seen = {}
+    function_tool = {
+        "type": "function",
+        "name": "lookup_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_backend_image_generation")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    request_payload = {
+        "model": "gpt-5.2",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Weather?"}]}],
+        "tools": [{"type": "image_generation", "output_format": "png"}, function_tool],
+    }
+    resp = await async_client.post("/backend-api/codex/responses", json=request_payload)
+    assert resp.status_code == 200
+    assert seen["payload"].tools == [{"type": "image_generation", "output_format": "png"}, function_tool]
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_preserve_explicit_image_generation_tool_choice(async_client, monkeypatch):
+    await _import_account(async_client, "acc_backend_explicit_image_gen", "backend-explicit-image-gen@example.com")
+
+    seen = {}
+    image_tool = {"type": "image_generation", "output_format": "png"}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_backend_explicit_image_generation")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    request_payload = {
+        "model": "gpt-5.2",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Draw?"}]}],
+        "tools": [image_tool],
+        "tool_choice": {"type": "image_generation"},
+    }
+    resp = await async_client.post("/backend-api/codex/responses", json=request_payload)
+
+    assert resp.status_code == 200
+    assert seen["payload"].tools == [image_tool]
+    assert seen["payload"].tool_choice == {"type": "image_generation"}
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_preserve_required_image_generation_tool_choice(async_client, monkeypatch):
+    await _import_account(async_client, "acc_backend_required_image_gen", "backend-required-image-gen@example.com")
+
+    seen = {}
+    image_tool = {"type": "image_generation", "output_format": "png"}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_backend_required_image_generation")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    request_payload = {
+        "model": "gpt-5.2",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Draw?"}]}],
+        "tools": [image_tool],
+        "tool_choice": "required",
+    }
+    resp = await async_client.post("/backend-api/codex/responses", json=request_payload)
+
+    assert resp.status_code == 200
+    assert seen["payload"].tools == [image_tool]
+    assert seen["payload"].tool_choice == "required"
 
 
 @pytest.mark.asyncio
@@ -494,6 +704,256 @@ async def test_v1_chat_completions_rejects_strict_schema_violation(async_client)
 
 
 @pytest.mark.asyncio
+async def test_v1_chat_completions_rejects_strict_function_tool_violation(async_client):
+    """Strict-mode violations on function tool parameters are rejected with 400.
+
+    Before this fix, ``_normalize_chat_tools`` dropped the ``strict`` flag
+    silently, so the request reached the upstream Codex backend with a
+    spec-violating schema and surfaced as a 502 ``upstream_rejected_input``.
+    Real OpenAI returns 400 ``invalid_function_parameters`` for the same
+    payload; codex-lb now does too.
+    """
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "Weather in Seoul?"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        # No additionalProperties: false → strict-mode violation.
+                    },
+                    "strict": True,
+                },
+            }
+        ],
+    }
+    resp = await async_client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_function_parameters"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "tools[0].function.parameters"
+    assert "get_weather" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_strict_violation_param_uses_original_index(async_client):
+    """Regression: when ``_normalize_chat_tools`` drops earlier entries,
+    the strict-validator's ``param`` must still point at the *inbound*
+    index so clients can map the error back to their payload.
+
+    Index 0 is an invalid function tool (no ``name``) — the normalizer
+    will drop it. Index 1 is the real strict violation. The error
+    envelope must surface ``tools[1].function.parameters``, not
+    ``tools[0].function.parameters``.
+    """
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "Weather in Seoul?"}],
+        "tools": [
+            # Index 0: dropped by ``_normalize_chat_tools`` (missing name).
+            {
+                "type": "function",
+                "function": {
+                    "description": "no name → dropped",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            # Index 1: strict violation (missing additionalProperties).
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                    "strict": True,
+                },
+            },
+        ],
+    }
+    resp = await async_client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_function_parameters"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "tools[1].function.parameters"
+    assert "get_weather" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_strict_violation_when_type_omitted_in_chat_tool(async_client):
+    """Regression for the second codex review pass on PR #658.
+
+    ``_normalize_chat_tools`` coerces a tool with ``"function": {...}``
+    into a function tool even when the top-level ``"type"`` is omitted
+    (``"type": tool_type or "function"`` at chat_requests.py:198). The
+    strict pre-validator must mirror that detection rule — anchoring on
+    the presence of the ``function`` wrapper dict, not on a strict
+    ``type == "function"`` check — otherwise type-omitted strict
+    violations bypass the local 400 and surface as upstream 5xx.
+    """
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "Weather in Seoul?"}],
+        "tools": [
+            {
+                # No top-level ``"type"`` — the chat normalizer still
+                # treats this as a function tool.
+                "function": {
+                    "name": "get_weather",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        # No additionalProperties → strict violation.
+                    },
+                    "strict": True,
+                },
+            }
+        ],
+    }
+    resp = await async_client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_function_parameters"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "tools[0].function.parameters"
+    assert "get_weather" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_responses_shaped_input_rejects_flat_strict_tool(async_client):
+    """Responses-shaped chat payloads must run the flat Responses strict validator."""
+    payload = {
+        "model": "gpt-5.2",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Weather in Seoul?"}]}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "x",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+                "strict": True,
+            }
+        ],
+    }
+    resp = await async_client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_function_parameters"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "tools[0].parameters"
+    assert "get_weather" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_responses_shaped_input_preserves_mcp_tool(async_client, monkeypatch):
+    await _import_account(async_client, "acc_chat_mcp_tool", "chat-mcp-tool@example.com")
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_chat_mcp_tool")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    tool = {
+        "type": "mcp",
+        "server_label": "filesystem",
+        "server_url": "https://example.com/mcp",
+        "require_approval": "never",
+    }
+    payload = {
+        "model": "gpt-5.2",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Run tool."}]}],
+        "tools": [tool],
+        "tool_choice": {"type": "mcp", "server_label": "filesystem"},
+    }
+
+    resp = await async_client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 200
+    assert seen["payload"].tools == [tool]
+    assert seen["payload"].tool_choice == {"type": "mcp", "server_label": "filesystem"}
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_rejects_strict_function_tool_violation(async_client):
+    """Same as the chat-completions case, but on the native /v1/responses endpoint.
+
+    The param shape differs: native responses callers see
+    ``tools[<i>].parameters`` rather than ``tools[<i>].function.parameters``.
+    """
+    payload = {
+        "model": "gpt-5.2",
+        "input": [{"role": "user", "content": "Weather in Seoul?"}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "x",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+                "strict": True,
+            }
+        ],
+    }
+    resp = await async_client.post("/v1/responses", json=payload)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_function_parameters"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "tools[0].parameters"
+    assert "get_weather" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_rejects_strict_schema_violation_with_specific_error(async_client):
+    """Backend /responses must preserve strict-validator error code and message."""
+    payload = {
+        "model": "gpt-5.2",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Return JSON."}]}],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "result_schema",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                },
+            }
+        },
+    }
+    resp = await async_client.post("/backend-api/codex/responses", json=payload)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_json_schema"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "text.format.schema"
+    assert "additionalProperties" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_v1_chat_completions_rejects_missing_json_schema(async_client):
     payload = {
         "model": "gpt-5.2",
@@ -588,6 +1048,37 @@ async def test_v1_chat_completions_rejects_builtin_tools(async_client):
     }
     resp = await async_client.post("/v1/chat/completions", json=payload)
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_accepts_responses_shaped_builtin_tools(async_client, monkeypatch):
+    await _import_account(async_client, "acc_chat_builtin_tools", "chat-builtin-tools@example.com")
+
+    seen = {}
+    image_tool = {"type": "image_generation", "output_format": "png"}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del headers, access_token, account_id, base_url, raise_for_status
+        seen["payload"] = payload
+        yield _completed_event("resp_chat_builtin_tools")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.2",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Generate an image."}],
+            }
+        ],
+        "tools": [image_tool],
+        "tool_choice": {"type": "image_generation"},
+    }
+    resp = await async_client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 200
+    assert seen["payload"].tools == [image_tool]
+    assert seen["payload"].tool_choice == {"type": "image_generation"}
 
 
 @pytest.mark.asyncio

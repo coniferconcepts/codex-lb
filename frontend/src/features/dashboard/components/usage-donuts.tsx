@@ -1,7 +1,14 @@
-import { useMemo } from "react";
+import { lazy, Suspense, useMemo } from "react";
+import { useTranslation } from "react-i18next";
 
-import { DonutChart } from "@/components/donut-chart";
+import type { DonutChartProps } from "@/components/donut-chart";
 import type { RemainingItem, SafeLineView } from "@/features/dashboard/utils";
+
+const DonutChart = lazy(() =>
+  import("@/components/donut-chart").then((module) => ({
+    default: (props: DonutChartProps) => <module.DonutChart {...props} />,
+  })),
+);
 
 export type UsageDonutsProps = {
 	primaryItems: RemainingItem[];
@@ -24,6 +31,7 @@ export function UsageDonuts({
 	safeLinePrimary,
 	safeLineSecondary,
 }: UsageDonutsProps) {
+	const { t } = useTranslation();
 	const primaryChartItems = useMemo(
 		() =>
 			primaryItems.map((item) => ({
@@ -50,21 +58,25 @@ export function UsageDonuts({
 	);
 
 	return (
-		<div className="grid gap-4 lg:grid-cols-2">
+		<Suspense fallback={<div className="grid gap-4 lg:grid-cols-2" />}>
+			<div className="grid gap-4 lg:grid-cols-2">
 			<DonutChart
-				title="5h Remaining"
+				title={t("dashboard.usage.fiveHourCredits")}
 				items={primaryChartItems}
 				total={primaryTotal}
 				centerValue={primaryCenterValue}
 				safeLine={safeLinePrimary}
+				centerLayout="credits"
 			/>
 			<DonutChart
-				title="Weekly Remaining"
+				title={t("dashboard.usage.weeklyCredits")}
 				items={secondaryChartItems}
 				total={secondaryTotal}
 				centerValue={secondaryCenterValue}
 				safeLine={safeLineSecondary}
+				centerLayout="credits"
 			/>
-		</div>
+			</div>
+		</Suspense>
 	);
 }

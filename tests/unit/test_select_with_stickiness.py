@@ -9,20 +9,36 @@ from __future__ import annotations
 
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
-from app.core.balancer import AccountState, RoutingStrategy
+from app.core.balancer import AccountState, RoutingCost, RoutingCostsByAccount, RoutingStrategy
 from app.db.models import Account, AccountStatus, StickySessionKind
+from app.modules.proxy._load_balancer.sticky_selection import (
+    _STICKY_EXISTING_UNSET,
+    _sticky_refresh_write_skippable,
+)
 from app.modules.proxy.load_balancer import LoadBalancer
 
 pytestmark = pytest.mark.unit
 
 
-def _active(account_id: str, used_percent: float = 10.0) -> AccountState:
-    return AccountState(account_id, AccountStatus.ACTIVE, used_percent=used_percent)
+def _active(
+    account_id: str,
+    used_percent: float = 10.0,
+    secondary_used_percent: float | None = None,
+    routing_policy: str = "normal",
+) -> AccountState:
+    return AccountState(
+        account_id,
+        AccountStatus.ACTIVE,
+        used_percent=used_percent,
+        secondary_used_percent=secondary_used_percent,
+        routing_policy=routing_policy,
+    )
 
 
 def _rate_limited(
@@ -30,6 +46,7 @@ def _rate_limited(
     reset_at: float | None = None,
     cooldown_until: float | None = None,
     used_percent: float | None = None,
+    routing_policy: str = "normal",
 ) -> AccountState:
     return AccountState(
         account_id,
@@ -39,6 +56,7 @@ def _rate_limited(
         cooldown_until=cooldown_until,
         error_count=1,
         last_error_at=time.time(),
+        routing_policy=routing_policy,
     )
 
 
@@ -59,7 +77,13 @@ async def _invoke_stickiness(
     reallocate_sticky: bool = False,
     sticky_max_age_seconds: int | None = 600,
     budget_threshold_pct: float = 95.0,
+    secondary_budget_threshold_pct: float = 100.0,
     routing_strategy: RoutingStrategy = "usage_weighted",
+    relative_availability_power: float = 2.0,
+    relative_availability_top_k: int = 5,
+    routing_costs_by_account_id: RoutingCostsByAccount | None = None,
+    sticky_refresh_skip_deadline: datetime | None = None,
+    sticky_existing_account_id: str | None | object = _STICKY_EXISTING_UNSET,
 ):
     """Wrapper that calls production LoadBalancer._select_with_stickiness.
 
@@ -74,7 +98,7 @@ async def _invoke_stickiness(
     lb = LoadBalancer(mock_repo_factory)
     account_map = {s.account_id: cast(Account, AsyncMock()) for s in states}
 
-    return await lb._select_with_stickiness(
+    outcome = await lb._select_with_stickiness(
         states=states,
         account_map=account_map,
         sticky_key=sticky_key,
@@ -82,10 +106,35 @@ async def _invoke_stickiness(
         reallocate_sticky=reallocate_sticky,
         sticky_max_age_seconds=sticky_max_age_seconds,
         budget_threshold_pct=budget_threshold_pct,
+        secondary_budget_threshold_pct=secondary_budget_threshold_pct,
         prefer_earlier_reset_accounts=False,
+        prefer_earlier_reset_window="secondary",
         routing_strategy=routing_strategy,
+        relative_availability_power=relative_availability_power,
+        relative_availability_top_k=relative_availability_top_k,
         sticky_repo=sticky_repo,
+        routing_costs_by_account_id=routing_costs_by_account_id,
+        sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
+        sticky_existing_account_id=sticky_existing_account_id,
     )
+    # Mirror the production persist site (run_sticky_selection_path): a pure
+    # same-owner freshness rewrite is omitted only after revalidating its
+    # observed skip deadline at write time.
+    if outcome.mutation is not None and not _sticky_refresh_write_skippable(
+        outcome.mutation,
+        initialize_seed_key=None,
+    ):
+        await lb._persist_sticky_mutation(
+            sticky_repo=sticky_repo,
+            sticky_key=sticky_key,
+            sticky_kind=sticky_kind,
+            mutation=outcome.mutation,
+        )
+    return outcome.selection
+
+
+def _future_deadline(seconds: float = 10.0) -> datetime:
+    return datetime.now(tz=timezone.utc).replace(tzinfo=None) + timedelta(seconds=seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +204,7 @@ async def test_fallback_overwrites_sticky_when_reallocate_sticky_true():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once()
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.STICKY_THREAD)
 
 
@@ -196,9 +245,8 @@ async def test_sticky_preserved_then_returns_to_original_on_recovery():
 
 
 @pytest.mark.asyncio
-async def test_sticky_deleted_when_pinned_account_removed_from_pool():
-    """When the pinned account is no longer in the account pool (deleted),
-    the sticky session IS deleted and a new mapping IS persisted."""
+async def test_sticky_rebound_when_pinned_account_removed_from_pool():
+    """When the pinned account leaves the pool, one upsert replaces its mapping."""
     acc_b = _active("b")
     repo = _make_sticky_repo(existing_account_id="a")
 
@@ -211,8 +259,27 @@ async def test_sticky_deleted_when_pinned_account_removed_from_pool():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("key1", kind=StickySessionKind.PROMPT_CACHE)
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_stale_sticky_owner_is_deleted_when_no_replacement_exists():
+    repo = _make_sticky_repo(existing_account_id="removed")
+
+    result = await _invoke_stickiness(
+        [],
+        "key-without-replacement",
+        repo,
+        reallocate_sticky=False,
+    )
+
+    assert result.account is None
+    repo.delete.assert_called_once_with(
+        "key-without-replacement",
+        kind=StickySessionKind.PROMPT_CACHE,
+    )
+    repo.upsert.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +323,7 @@ async def test_pool_exhausted_but_better_candidate_exists_reallocates():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("key1", kind=StickySessionKind.PROMPT_CACHE)
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
 
 
@@ -278,8 +345,29 @@ async def test_round_robin_pool_health_check_prefers_budget_safe_candidate():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("key-round-robin", kind=StickySessionKind.PROMPT_CACHE)
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key-round-robin", "b", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_sticky_fallback_applies_planner_costs():
+    now = time.time()
+    acc_a = _rate_limited("a", cooldown_until=now + 60)
+    acc_b = _active("b", used_percent=10.0)
+    acc_c = _active("c", used_percent=30.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b, acc_c],
+        "key-routing-cost",
+        repo,
+        reallocate_sticky=False,
+        routing_costs_by_account_id={"b": RoutingCost(total=40.0), "c": RoutingCost(total=-5.0)},
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "c"
+    repo.upsert.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -320,7 +408,7 @@ async def test_capacity_weighted_pool_health_check_prefers_budget_safe_candidate
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("key-capacity-weighted", kind=StickySessionKind.PROMPT_CACHE)
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key-capacity-weighted", "b", kind=StickySessionKind.PROMPT_CACHE)
 
 
@@ -377,7 +465,7 @@ async def test_pool_exhausted_candidate_with_none_usage_triggers_reallocation():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("key1", kind=StickySessionKind.PROMPT_CACHE)
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
 
 
@@ -398,6 +486,43 @@ async def test_first_request_creates_sticky_mapping():
     assert result.account is not None
     assert result.account.account_id == "a"
     repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_first_sticky_request_honors_relative_availability_tuning():
+    """When no sticky mapping exists yet, fallback selection must still use
+    configured relative-availability tuning instead of hard-coded defaults."""
+    now = time.time()
+    acc_a = AccountState(
+        "a",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        secondary_reset_at=int(now + 10 * 60),
+        capacity_credits=1_000.0,
+    )
+    acc_b = AccountState(
+        "b",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        secondary_reset_at=int(now + 11 * 60),
+        capacity_credits=900.0,
+    )
+    repo = _make_sticky_repo(existing_account_id=None)
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key-relative-availability",
+        repo,
+        routing_strategy="relative_availability",
+        relative_availability_power=10.0,
+        relative_availability_top_k=1,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key-relative-availability", "a", kind=StickySessionKind.PROMPT_CACHE)
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +639,8 @@ async def test_grace_period_not_applied_for_reallocate_sticky():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once()
+    repo.delete.assert_not_called()
+    repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.STICKY_THREAD)
 
 
 @pytest.mark.asyncio
@@ -564,9 +690,9 @@ async def test_paused_pinned_account_persists_fallback():
 
 
 @pytest.mark.asyncio
-async def test_deactivated_pinned_account_persists_fallback():
-    """DEACTIVATED is permanent — same rebind behaviour as PAUSED."""
-    acc_a = AccountState("a", AccountStatus.DEACTIVATED, deactivation_reason="token expired")
+async def test_reauth_required_pinned_account_persists_fallback():
+    """REAUTH_REQUIRED is hard-blocked — same rebind behaviour as PAUSED."""
+    acc_a = AccountState("a", AccountStatus.REAUTH_REQUIRED, deactivation_reason="token expired")
     acc_b = _active("b")
     repo = _make_sticky_repo(existing_account_id="a")
 
@@ -694,7 +820,7 @@ async def test_budget_exhaustion_triggers_reallocation():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("key1", kind=StickySessionKind.PROMPT_CACHE)
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
 
 
@@ -714,7 +840,7 @@ async def test_budget_threshold_80_triggers_at_85_percent():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("key1", kind=StickySessionKind.PROMPT_CACHE)
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
 
 
@@ -756,7 +882,181 @@ async def test_budget_threshold_reallocates_codex_session_affinity():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("codex-session-123", kind=StickySessionKind.CODEX_SESSION)
+    repo.delete.assert_not_called()
+    repo.upsert.assert_called_once_with("codex-session-123", "b", kind=StickySessionKind.CODEX_SESSION)
+
+
+@pytest.mark.asyncio
+async def test_budget_threshold_reallocates_sticky_thread_affinity():
+    """STICKY_THREAD with the pinned account strictly above the budget
+    threshold must rebind to a healthier candidate (parity with
+    PROMPT_CACHE / CODEX_SESSION)."""
+    acc_a = _active("a", used_percent=96.0)
+    acc_b = _active("b", used_percent=50.0)
+
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "thread-X",
+        repo,
+        sticky_kind=StickySessionKind.STICKY_THREAD,
+        reallocate_sticky=True,
+        sticky_max_age_seconds=None,
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
+    repo.delete.assert_not_called()
+    repo.upsert.assert_called_once_with("thread-X", "b", kind=StickySessionKind.STICKY_THREAD)
+
+
+@pytest.mark.asyncio
+async def test_budget_threshold_reallocates_to_primary_safe_secondary_pressured_candidate():
+    acc_a = _active("a", used_percent=99.0, secondary_used_percent=1.0)
+    acc_b = _active("b", used_percent=10.0, secondary_used_percent=99.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "codex-session-123",
+        repo,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        reallocate_sticky=False,
+        sticky_max_age_seconds=None,
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
+    repo.delete.assert_not_called()
+    repo.upsert.assert_called_once_with("codex-session-123", "b", kind=StickySessionKind.CODEX_SESSION)
+
+
+@pytest.mark.asyncio
+async def test_sticky_thread_preserves_pinned_when_pool_also_above_threshold():
+    """When every candidate is above the budget threshold, STICKY_THREAD
+    must stay pinned to avoid thrashing (parity with the existing
+    capacity-weighted budget-pressure tests)."""
+    acc_a = _active("a", used_percent=99.0)
+    acc_b = _active("b", used_percent=96.0)
+
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "thread-Y",
+        repo,
+        sticky_kind=StickySessionKind.STICKY_THREAD,
+        reallocate_sticky=True,
+        sticky_max_age_seconds=None,
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_budget_threshold_preserves_sticky_when_every_candidate_secondary_pressured():
+    acc_a = _active("a", used_percent=10.0, secondary_used_percent=99.0)
+    acc_b = _active("b", used_percent=20.0, secondary_used_percent=99.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "codex-session-123",
+        repo,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        reallocate_sticky=False,
+        sticky_max_age_seconds=None,
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
+    repo.upsert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sticky_thread_below_threshold_does_not_reallocate():
+    """Below the budget threshold, STICKY_THREAD must keep affinity
+    (regression guard against over-triggering reallocation)."""
+    acc_a = _active("a", used_percent=85.0)
+    acc_b = _active("b", used_percent=10.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "thread-Z",
+        repo,
+        sticky_kind=StickySessionKind.STICKY_THREAD,
+        reallocate_sticky=True,
+        sticky_max_age_seconds=None,
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fresh_sticky_mapping_uses_normal_budget_gate():
+    # "a" is secondary-pressured (99% > secondary threshold 98%) but must stay
+    # eligible for a FRESH mapping: the secondary budget gate applies only to
+    # sticky reallocation, not to normal selection. Mark "b" as recently
+    # selected so round_robin's least-recently-selected primary key
+    # deterministically prefers "a" whenever "a" is eligible — the selection
+    # must not fall through to the final tie-break, which is decorrelated per
+    # replica (keyed on the host identity) and therefore host-dependent.
+    # If the secondary gate were wrongly applied here, "a" would be excluded
+    # and "b" selected, failing the assertion below.
+    acc_a = _active("a", used_percent=10.0, secondary_used_percent=99.0)
+    acc_b = _active("b", used_percent=20.0, secondary_used_percent=10.0)
+    acc_b.last_selected_at = time.time()
+    repo = _make_sticky_repo(existing_account_id=None)
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "new-codex-session",
+        repo,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=None,
+        budget_threshold_pct=95.0,
+        secondary_budget_threshold_pct=98.0,
+        routing_strategy="round_robin",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
+    repo.upsert.assert_called_once_with("new-codex-session", "a", kind=StickySessionKind.CODEX_SESSION)
+
+
+@pytest.mark.asyncio
+async def test_secondary_budget_threshold_controls_sticky_reallocation():
+    acc_a = _active("a", used_percent=10.0, secondary_used_percent=99.0)
+    acc_b = _active("b", used_percent=20.0, secondary_used_percent=10.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "codex-session-123",
+        repo,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        reallocate_sticky=False,
+        sticky_max_age_seconds=None,
+        budget_threshold_pct=95.0,
+        secondary_budget_threshold_pct=98.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("codex-session-123", "b", kind=StickySessionKind.CODEX_SESSION)
 
 
@@ -778,5 +1078,200 @@ async def test_rate_limit_far_away_triggers_reallocation():
 
     assert result.account is not None
     assert result.account.account_id == "b"
-    repo.delete.assert_called_once_with("key1", kind=StickySessionKind.PROMPT_CACHE)
+    repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_burn_first_reallocation_only_when_burn_first_is_selectable():
+    now = time.time()
+    pinned = _active("a", used_percent=96.0)
+    blocked_burn_first = _rate_limited(
+        "b",
+        reset_at=now + 1200,
+        routing_policy="burn_first",
+    )
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [pinned, blocked_burn_first],
+        "key1",
+        repo,
+        reallocate_sticky=False,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+# ---------------------------------------------------------------------------
+# Same-owner refresh skip: hot (key, kind) rows must not be rewritten on every
+# request when the lookup already observed a fresh row.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_pinned_retention_skips_upsert():
+    """A healthy pinned owner within the refresh-skip window routes to the
+    pinned account without any sticky write."""
+    acc_a = _active("a", used_percent=10.0)
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_not_called()
+    repo.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_false_pinned_retention_still_refreshes():
+    """Without the freshness observation the pinned retention keeps its
+    write-through updated_at refresh."""
+    acc_a = _active("a", used_percent=10.0)
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=None,
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_never_suppresses_reallocation_write():
+    """Budget-pressure rebind to a different owner must persist immediately
+    even when the old row was observed fresh."""
+    acc_a = _active("a", used_percent=96.0)
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
+    repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_never_suppresses_departed_owner_rebind():
+    """A pinned owner that left the pool is still rebound with an immediate
+    write even when the old row was observed fresh."""
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
+    repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_grace_period_retention_skips_upsert():
+    """The grace-period pinned retention also honors the skip window."""
+    now = time.time()
+    pinned = _rate_limited("a", reset_at=now + 10)
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [pinned, acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_reset_when_existing_owner_not_prefetched():
+    """The freshness observation belongs to the caller-provided lookup; an
+    internal owner lookup must fall back to write-through refresh."""
+    acc_a = _active("a", used_percent=10.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skip_deadline_expired_at_persist_time_still_refreshes():
+    """The skip deadline is revalidated at write time: a deadline that lapsed
+    between lookup and persist must not suppress the refresh, keeping the
+    mapping's effective expiry within the documented skip-window bound."""
+    acc_a = _active("a", used_percent=10.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(-0.5),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+def test_refresh_write_skippable_guards_seed_and_delete_and_deadline():
+    """The persist-time gate never skips deletes, seed-initializing writes,
+    non-datetime deadlines (auto-vivified test doubles), or lapsed deadlines."""
+    from app.modules.proxy._load_balancer.sticky_selection import _StickyMutation
+
+    refresh = _StickyMutation(account_id="a", refresh_skip_deadline=_future_deadline())
+    assert _sticky_refresh_write_skippable(refresh, initialize_seed_key=None) is True
+    # Seed initialization piggybacks on this write and must never be skipped.
+    assert _sticky_refresh_write_skippable(refresh, initialize_seed_key="seed-key") is False
+    # Deletes are never skippable.
+    delete = _StickyMutation(account_id=None, refresh_skip_deadline=_future_deadline())
+    assert _sticky_refresh_write_skippable(delete, initialize_seed_key=None) is False
+    # A lapsed deadline fails revalidation.
+    expired = _StickyMutation(account_id="a", refresh_skip_deadline=_future_deadline(-0.5))
+    assert _sticky_refresh_write_skippable(expired, initialize_seed_key=None) is False
+    # Mutations without an observed deadline always write through.
+    plain = _StickyMutation(account_id="a")
+    assert _sticky_refresh_write_skippable(plain, initialize_seed_key=None) is False

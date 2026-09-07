@@ -35,6 +35,14 @@ class UsageTokens:
 
 
 @dataclass(frozen=True)
+class UsageCostBreakdown:
+    input_usd: float | None
+    cached_input_usd: float | None
+    output_usd: float | None
+    total_usd: float | None
+
+
+@dataclass(frozen=True)
 class CostItem:
     model: str
     usage: UsageTokens
@@ -49,7 +57,17 @@ def _as_number(value: int | float | None) -> float | None:
 
 def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens | None:
     if isinstance(usage, UsageTokens):
-        return usage
+        input_tokens = _as_number(usage.input_tokens)
+        output_tokens = _as_number(usage.output_tokens)
+        cached_tokens = _as_number(usage.cached_input_tokens)
+        if input_tokens is None or output_tokens is None:
+            return None
+        cached_tokens = max(0.0, min(cached_tokens or 0.0, input_tokens))
+        return UsageTokens(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_tokens,
+        )
     if not usage:
         return None
     input_tokens = _as_number(usage.input_tokens)
@@ -70,6 +88,51 @@ def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens |
 
 
 DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
+    "gpt-5.6-sol": ModelPrice(
+        input_per_1m=5.0,
+        cached_input_per_1m=0.5,
+        output_per_1m=30.0,
+        priority_input_per_1m=10.0,
+        priority_cached_input_per_1m=1.0,
+        priority_output_per_1m=60.0,
+        flex_input_per_1m=2.5,
+        flex_cached_input_per_1m=0.25,
+        flex_output_per_1m=15.0,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=10.0,
+        long_context_cached_input_per_1m=1.0,
+        long_context_output_per_1m=45.0,
+    ),
+    "gpt-5.6-terra": ModelPrice(
+        input_per_1m=2.0,
+        cached_input_per_1m=0.2,
+        output_per_1m=12.0,
+        priority_input_per_1m=4.0,
+        priority_cached_input_per_1m=0.4,
+        priority_output_per_1m=24.0,
+        flex_input_per_1m=1.0,
+        flex_cached_input_per_1m=0.1,
+        flex_output_per_1m=6.0,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=4.0,
+        long_context_cached_input_per_1m=0.4,
+        long_context_output_per_1m=18.0,
+    ),
+    "gpt-5.6-luna": ModelPrice(
+        input_per_1m=0.2,
+        cached_input_per_1m=0.02,
+        output_per_1m=1.2,
+        priority_input_per_1m=0.4,
+        priority_cached_input_per_1m=0.04,
+        priority_output_per_1m=2.4,
+        flex_input_per_1m=0.1,
+        flex_cached_input_per_1m=0.01,
+        flex_output_per_1m=0.6,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=0.4,
+        long_context_cached_input_per_1m=0.04,
+        long_context_output_per_1m=1.8,
+    ),
     "gpt-5.5": ModelPrice(
         input_per_1m=5.0,
         cached_input_per_1m=0.5,
@@ -260,6 +323,10 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
 }
 
 DEFAULT_MODEL_ALIASES: dict[str, str] = {
+    "gpt-5.6": "gpt-5.6-sol",
+    "gpt-5.6-sol*": "gpt-5.6-sol",
+    "gpt-5.6-terra*": "gpt-5.6-terra",
+    "gpt-5.6-luna*": "gpt-5.6-luna",
     "gpt-5.5-pro*": "gpt-5.5-pro",
     "gpt-5.5*": "gpt-5.5",
     "gpt-5.4-pro*": "gpt-5.4-pro",
@@ -403,10 +470,23 @@ def calculate_cost_from_usage(
     *,
     service_tier: str | None = None,
 ) -> float | None:
+    breakdown = calculate_cost_breakdown_from_usage(usage, price, service_tier=service_tier)
+    if breakdown is None:
+        return None
+    return breakdown.total_usd
+
+
+def calculate_cost_breakdown_from_usage(
+    usage: UsageTokens | ResponseUsage | None,
+    price: ModelPrice,
+    *,
+    service_tier: str | None = None,
+    precision: int | None = None,
+) -> UsageCostBreakdown | None:
     normalized = _normalize_usage(usage)
     if not normalized:
         return None
-    billable_input = normalized.input_tokens - normalized.cached_input_tokens
+    billable_input = max(0.0, normalized.input_tokens - normalized.cached_input_tokens)
 
     input_rate, cached_rate, output_rate = _effective_rates(
         normalized,
@@ -414,10 +494,25 @@ def calculate_cost_from_usage(
         service_tier=service_tier,
     )
 
-    return (
-        (billable_input / 1_000_000) * input_rate
-        + (normalized.cached_input_tokens / 1_000_000) * cached_rate
-        + (normalized.output_tokens / 1_000_000) * output_rate
+    input_usd = (billable_input / 1_000_000) * input_rate
+    cached_input_usd = (normalized.cached_input_tokens / 1_000_000) * cached_rate
+    output_usd = (normalized.output_tokens / 1_000_000) * output_rate
+
+    if precision is not None:
+        input_usd = round(input_usd, precision)
+        cached_input_usd = round(cached_input_usd, precision)
+        output_usd = round(output_usd, precision)
+
+    total_usd = input_usd + cached_input_usd + output_usd
+
+    if precision is not None:
+        total_usd = round(total_usd, precision)
+
+    return UsageCostBreakdown(
+        input_usd=input_usd,
+        cached_input_usd=cached_input_usd,
+        output_usd=output_usd,
+        total_usd=total_usd,
     )
 
 

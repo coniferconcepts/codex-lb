@@ -6,6 +6,7 @@ from app.core import usage as usage_core
 from app.core.usage.types import UsageWindowRow
 from app.db.models import Account
 from app.modules.dashboard.schemas import (
+    DashboardMetricsComparison,
     DashboardOverviewSummary,
     DashboardOverviewTimeframe,
     DashboardOverviewTimeframeKey,
@@ -73,6 +74,7 @@ def build_dashboard_overview_summary(
     secondary_rows: list[UsageWindowRow],
     activity_cost: ActivityCostSummary,
     activity_metrics: ActivityMetricsSummary,
+    comparison: DashboardMetricsComparison | None = None,
 ) -> DashboardOverviewSummary:
     account_map = {account.id: account for account in accounts}
     primary_summary = usage_core.summarize_usage_window(primary_rows, account_map, "primary")
@@ -88,12 +90,18 @@ def build_dashboard_overview_summary(
             currency=activity_cost.currency,
             totalUsd=activity_cost.total_usd,
         ),
-        metrics=DashboardUsageMetrics(
-            requests=activity_metrics.requests,
-            tokens=activity_metrics.tokens,
-            cached_input_tokens=activity_metrics.cached_input_tokens,
-            error_rate=activity_metrics.error_rate,
-            error_count=activity_metrics.error_count,
-            top_error=activity_metrics.top_error,
+        metrics=DashboardUsageMetrics.model_validate(
+            {
+                "requests": activity_metrics.requests,
+                "tokens": activity_metrics.tokens,
+                "cached_input_tokens": activity_metrics.cached_input_tokens,
+                "error_rate": activity_metrics.error_rate,
+                "error_count": activity_metrics.error_count,
+                "cancelled_count": activity_metrics.cancelled_count,
+                "top_error": activity_metrics.top_error,
+                "conversations": activity_metrics.conversation_count,
+                "conversation_requests": activity_metrics.conversation_request_count,
+            }
         ),
+        comparison=comparison,
     )

@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import App from "@/App";
-import { createApiKey, createApiKeyUsage7Day } from "@/test/mocks/factories";
+import { createApiKey, createApiKeyCreateResponse, createApiKeyUsage7Day } from "@/test/mocks/factories";
 import { server } from "@/test/mocks/server";
 import { renderWithProviders } from "@/test/utils";
 
@@ -25,12 +25,13 @@ describe("apis page integration", () => {
 		renderWithProviders(<App />);
 
 		expect(await screen.findByRole("heading", { name: "APIs" })).toBeInTheDocument();
+		expect(await screen.findByText("Overview")).toBeInTheDocument();
 		expect(await screen.findByRole("heading", { name: "Read only key" })).toBeInTheDocument();
 
 		const search = screen.getByPlaceholderText("Search API keys...");
 		await user.type(search, "Default");
 
-		expect(screen.getByText("Default key")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: /Default key/i })).toBeInTheDocument();
 
 		await user.click(screen.getByRole("button", { name: /Default key/i }));
 		expect(await screen.findByRole("heading", { name: "Default key" })).toBeInTheDocument();
@@ -50,7 +51,36 @@ describe("apis page integration", () => {
 		expect(within(dialog).getByText(/It will not be shown again/)).toBeInTheDocument();
 
 		await user.click(getDialogFooterClose(dialog));
-		expect(await screen.findByText("Created from APIs page")).toBeInTheDocument();
+		expect(await screen.findByRole("button", { name: /Created from APIs page/i })).toBeInTheDocument();
+	});
+
+	it("creates a key with a selectable reasoning-effort policy", async () => {
+		const user = userEvent.setup();
+		let requestBody: unknown;
+		server.use(
+				http.post("/api/api-keys/", async ({ request }) => {
+				requestBody = await request.json();
+				return HttpResponse.json(createApiKeyCreateResponse({ name: "Selectable effort key" }));
+			}),
+		);
+		renderWithProviders(<App />);
+
+		await user.click(await screen.findByRole("button", { name: "Create API Key" }));
+		const createDialog = await screen.findByRole("dialog", { name: "Create API key" });
+		await user.type(within(createDialog).getByLabelText("Name"), "Selectable effort key");
+		await user.click(within(createDialog).getByRole("button", { name: "Allowed efforts: All efforts" }));
+		await user.click(screen.getByRole("menuitemcheckbox", { name: /^Low$/ }));
+		await user.keyboard("{Escape}");
+
+		expect(within(createDialog).getByLabelText("Enforced Effort")).toBeDisabled();
+
+		await user.click(within(createDialog).getByRole("button", { name: "Create" }));
+		await waitFor(() => {
+			expect(requestBody).toMatchObject({
+				allowedReasoningEfforts: ["low"],
+				enforcedReasoningEffort: null,
+			});
+		});
 	});
 
 	it("edits, toggles, regenerates, and deletes the selected key", async () => {
@@ -118,7 +148,7 @@ describe("apis page integration", () => {
 		renderWithProviders(<App />);
 
 		expect(await screen.findByRole("heading", { name: "APIs" })).toBeInTheDocument();
-		expect(await screen.findByText("No matching API keys")).toBeInTheDocument();
+		expect(await screen.findByText("No API keys yet")).toBeInTheDocument();
 		expect(screen.getByText("Select an API key")).toBeInTheDocument();
 	});
 
@@ -170,9 +200,10 @@ describe("apis page integration", () => {
 
 		expect(await screen.findByRole("heading", { name: "Custom analytics key" })).toBeInTheDocument();
 		expect(screen.getByText("All models")).toBeInTheDocument();
-		expect(await screen.findByText(/12K tok/)).toBeInTheDocument();
-		expect(await screen.findByText(/3K cached/)).toBeInTheDocument();
-		expect(await screen.findByText(/42 req/)).toBeInTheDocument();
-		expect(await screen.findByText(/\$0.42/)).toBeInTheDocument();
+		const apiKeyInfo = screen.getByTestId("api-key-info");
+		expect(await within(apiKeyInfo).findByText(/12K tok/)).toBeInTheDocument();
+		expect(await within(apiKeyInfo).findByText(/3K cached/)).toBeInTheDocument();
+		expect(await within(apiKeyInfo).findByText(/42 req/)).toBeInTheDocument();
+		expect(await within(apiKeyInfo).findByText(/\$0.42/)).toBeInTheDocument();
 	});
 });

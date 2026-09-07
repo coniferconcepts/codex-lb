@@ -8,10 +8,13 @@ from app.core.utils.time import utcnow
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.builders import (
+    build_usage_cost_from_aggregate,
     build_usage_history_response,
+    build_usage_metrics_from_aggregate,
     build_usage_summary_response,
     build_usage_window_response,
 )
+from app.modules.usage.mappers import usage_history_to_window_row
 from app.modules.usage.repository import UsageRepository
 from app.modules.usage.schemas import (
     UsageHistoryResponse,
@@ -37,20 +40,28 @@ class UsageService:
 
         primary_rows_raw = await self._latest_usage_rows("primary")
         secondary_rows_raw = await self._latest_usage_rows("secondary")
+        monthly_rows_raw = await self._latest_usage_rows("monthly")
         primary_rows, secondary_rows = usage_core.normalize_weekly_only_rows(
             primary_rows_raw,
             secondary_rows_raw,
         )
 
         secondary_minutes = usage_core.resolve_window_minutes("secondary", secondary_rows)
-        logs_secondary = []
+        # Aggregate the window in SQL instead of hydrating every RequestLog
+        # ORM row (a 7-day secondary window is easily 10^5+ full rows).
+        logs_aggregate = None
         if secondary_minutes:
-            logs_secondary = await self._logs_repo.list_since(now - timedelta(minutes=secondary_minutes))
+            logs_aggregate = await self._logs_repo.aggregate_usage_metrics_since(
+                now - timedelta(minutes=secondary_minutes)
+            )
         return build_usage_summary_response(
             accounts=accounts,
             primary_rows=primary_rows,
             secondary_rows=secondary_rows,
-            logs_secondary=logs_secondary,
+            monthly_rows=monthly_rows_raw,
+            logs_secondary=[],
+            metrics_override=build_usage_metrics_from_aggregate(logs_aggregate),
+            cost_override=build_usage_cost_from_aggregate(logs_aggregate),
         )
 
     async def get_usage_history(self, hours: int) -> UsageHistoryResponse:
@@ -88,13 +99,4 @@ class UsageService:
 
     async def _latest_usage_rows(self, window: str) -> list[UsageWindowRow]:
         latest = await self._usage_repo.latest_by_account(window=window)
-        return [
-            UsageWindowRow(
-                account_id=entry.account_id,
-                used_percent=entry.used_percent,
-                reset_at=entry.reset_at,
-                window_minutes=entry.window_minutes,
-                recorded_at=entry.recorded_at,
-            )
-            for entry in latest.values()
-        ]
+        return [usage_history_to_window_row(entry) for entry in latest.values()]

@@ -9,6 +9,7 @@ from app.core.usage.pricing import (
     CostItem,
     ModelPrice,
     UsageTokens,
+    calculate_cost_breakdown_from_usage,
     calculate_cost_from_usage,
     calculate_costs,
     get_pricing_for_model,
@@ -63,6 +64,24 @@ def test_get_pricing_for_model_gpt_5_4_alias():
     assert model == "gpt-5.4"
 
 
+@pytest.mark.parametrize(
+    ("requested_model", "canonical_model"),
+    [
+        ("gpt-5.6", "gpt-5.6-sol"),
+        ("gpt-5.6-sol", "gpt-5.6-sol"),
+        ("gpt-5.6-sol-2026-07-13", "gpt-5.6-sol"),
+        ("gpt-5.6-terra", "gpt-5.6-terra"),
+        ("gpt-5.6-terra-2026-07-13", "gpt-5.6-terra"),
+        ("gpt-5.6-luna", "gpt-5.6-luna"),
+        ("gpt-5.6-luna-2026-07-13", "gpt-5.6-luna"),
+    ],
+)
+def test_get_pricing_for_model_gpt_5_6_aliases(requested_model: str, canonical_model: str) -> None:
+    result = get_pricing_for_model(requested_model, DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
+
+    assert result == (canonical_model, DEFAULT_PRICING_MODELS[canonical_model])
+
+
 def test_get_pricing_for_model_gpt_5_4_mini_alias():
     result = get_pricing_for_model("gpt-5.4-mini-2026-03-17", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
     assert result is not None
@@ -109,6 +128,87 @@ def test_calculate_cost_from_usage_cached_tokens():
     assert cost == pytest.approx(expected)
 
 
+def test_calculate_cost_breakdown_from_usage_cached_tokens():
+    usage = UsageTokens(
+        input_tokens=1_000.0,
+        output_tokens=500.0,
+        cached_input_tokens=200.0,
+    )
+    price = ModelPrice(input_per_1m=2.0, cached_input_per_1m=0.5, output_per_1m=4.0)
+
+    breakdown = calculate_cost_breakdown_from_usage(usage, price)
+
+    assert breakdown is not None
+    assert breakdown.input_usd == pytest.approx((800 / 1_000_000) * 2.0)
+    assert breakdown.cached_input_usd == pytest.approx((200 / 1_000_000) * 0.5)
+    assert breakdown.output_usd == pytest.approx((500 / 1_000_000) * 4.0)
+    assert breakdown.total_usd == pytest.approx(
+        ((800 / 1_000_000) * 2.0) + ((200 / 1_000_000) * 0.5) + ((500 / 1_000_000) * 4.0)
+    )
+
+
+def test_calculate_cost_breakdown_from_usage_clamps_cached_tokens():
+    usage = UsageTokens(
+        input_tokens=100.0,
+        output_tokens=500.0,
+        cached_input_tokens=200.0,
+    )
+    price = ModelPrice(input_per_1m=2.0, cached_input_per_1m=0.5, output_per_1m=4.0)
+
+    breakdown = calculate_cost_breakdown_from_usage(usage, price)
+
+    assert breakdown is not None
+    assert breakdown.input_usd == pytest.approx(0.0)
+    assert breakdown.cached_input_usd == pytest.approx((100 / 1_000_000) * 0.5)
+    assert breakdown.output_usd == pytest.approx((500 / 1_000_000) * 4.0)
+    assert breakdown.total_usd == pytest.approx(((100 / 1_000_000) * 0.5) + ((500 / 1_000_000) * 4.0))
+
+
+def test_calculate_cost_breakdown_from_usage_priority_service_tier():
+    usage = UsageTokens(
+        input_tokens=1_000_000.0,
+        output_tokens=1_000_000.0,
+        cached_input_tokens=100_000.0,
+    )
+    price = ModelPrice(
+        input_per_1m=2.5,
+        cached_input_per_1m=0.25,
+        output_per_1m=15.0,
+        priority_input_per_1m=5.0,
+        priority_cached_input_per_1m=0.5,
+        priority_output_per_1m=30.0,
+    )
+
+    breakdown = calculate_cost_breakdown_from_usage(
+        usage,
+        price,
+        service_tier="priority",
+    )
+
+    assert breakdown is not None
+    assert breakdown.input_usd == pytest.approx(4.5)
+    assert breakdown.cached_input_usd == pytest.approx(0.05)
+    assert breakdown.output_usd == pytest.approx(30.0)
+    assert breakdown.total_usd == pytest.approx(34.55)
+
+
+def test_calculate_cost_breakdown_from_usage_precision_rounds_components_first():
+    usage = UsageTokens(
+        input_tokens=200_000.0,
+        output_tokens=100_000.0,
+        cached_input_tokens=100_000.0,
+    )
+    price = ModelPrice(input_per_1m=0.144, cached_input_per_1m=0.144, output_per_1m=0.144)
+
+    breakdown = calculate_cost_breakdown_from_usage(usage, price, precision=2)
+
+    assert breakdown is not None
+    assert breakdown.input_usd == pytest.approx(0.01)
+    assert breakdown.cached_input_usd == pytest.approx(0.01)
+    assert breakdown.output_usd == pytest.approx(0.01)
+    assert breakdown.total_usd == pytest.approx(0.03)
+
+
 def test_calculate_cost_from_usage_priority_service_tier():
     usage = UsageTokens(input_tokens=1_000_000.0, output_tokens=1_000_000.0)
     price = DEFAULT_PRICING_MODELS["gpt-5.4"]
@@ -125,6 +225,88 @@ def test_calculate_cost_from_usage_flex_service_tier():
     cost = calculate_cost_from_usage(usage, price, service_tier="flex")
 
     assert cost == pytest.approx(2.625)
+
+
+@pytest.mark.parametrize(
+    ("model", "service_tier", "expected_cost"),
+    [
+        ("gpt-5.6-sol", None, 30.55),
+        ("gpt-5.6-sol", "flex", 15.275),
+        ("gpt-5.6-sol", "priority", 61.1),
+        ("gpt-5.6-sol", "fast", 61.1),
+        ("gpt-5.6-terra", None, 12.22),
+        ("gpt-5.6-terra", "flex", 6.11),
+        ("gpt-5.6-terra", "priority", 24.44),
+        ("gpt-5.6-terra", "fast", 24.44),
+        ("gpt-5.6-luna", None, 1.222),
+        ("gpt-5.6-luna", "flex", 0.611),
+        ("gpt-5.6-luna", "priority", 2.444),
+        ("gpt-5.6-luna", "fast", 2.444),
+    ],
+)
+def test_calculate_cost_from_usage_gpt_5_6_service_tiers(
+    model: str,
+    service_tier: str | None,
+    expected_cost: float,
+) -> None:
+    usage = UsageTokens(
+        input_tokens=200_000.0,
+        output_tokens=1_000_000.0,
+        cached_input_tokens=100_000.0,
+    )
+
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS[model], service_tier=service_tier)
+
+    assert cost == pytest.approx(expected_cost)
+
+
+@pytest.mark.parametrize(
+    ("model", "service_tier", "expected_cost"),
+    [
+        ("gpt-5.6-sol", None, 7.05),
+        ("gpt-5.6-sol", "flex", 3.525),
+        ("gpt-5.6-terra", None, 2.82),
+        ("gpt-5.6-terra", "flex", 1.41),
+        ("gpt-5.6-luna", None, 0.282),
+        ("gpt-5.6-luna", "flex", 0.141),
+    ],
+)
+def test_calculate_cost_from_usage_gpt_5_6_long_context(
+    model: str,
+    service_tier: str | None,
+    expected_cost: float,
+) -> None:
+    usage = UsageTokens(
+        input_tokens=300_000.0,
+        output_tokens=100_000.0,
+        cached_input_tokens=50_000.0,
+    )
+
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS[model], service_tier=service_tier)
+
+    assert cost == pytest.approx(expected_cost)
+
+
+@pytest.mark.parametrize(
+    ("model", "standard_input_rate", "long_context_input_rate"),
+    [
+        ("gpt-5.6-sol", 5.0, 10.0),
+        ("gpt-5.6-terra", 2.0, 4.0),
+        ("gpt-5.6-luna", 0.2, 0.4),
+    ],
+)
+def test_calculate_cost_from_usage_gpt_5_6_uses_272k_long_context_boundary(
+    model: str,
+    standard_input_rate: float,
+    long_context_input_rate: float,
+) -> None:
+    price = DEFAULT_PRICING_MODELS[model]
+
+    at_boundary = calculate_cost_from_usage(UsageTokens(input_tokens=272_000.0, output_tokens=0.0), price)
+    above_boundary = calculate_cost_from_usage(UsageTokens(input_tokens=272_001.0, output_tokens=0.0), price)
+
+    assert at_boundary == pytest.approx(272_000 / 1_000_000 * standard_input_rate)
+    assert above_boundary == pytest.approx(272_001 / 1_000_000 * long_context_input_rate)
 
 
 def test_calculate_cost_from_usage_service_tier_trims_whitespace():

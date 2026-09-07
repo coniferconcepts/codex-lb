@@ -6,7 +6,8 @@ import {
 	RefreshCw,
 	Trash2,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { AlertMessage } from "@/components/alert-message";
 import { Button } from "@/components/ui/button";
 import {
@@ -17,9 +18,21 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Switch } from "@/components/ui/switch";
 import type { ApiKey } from "@/features/api-keys/schemas";
+import type { AccountCostDonutProps } from "@/features/apis/components/account-cost-donut";
 import { ApiKeyInfo } from "@/features/apis/components/api-key-info";
-import { ApiTrendChart } from "@/features/apis/components/api-trend-chart";
+import type { ApiTrendChartProps } from "@/features/apis/components/api-trend-chart";
 import type { ApiKeyUsage7DayResponse } from "@/features/apis/schemas";
+
+const AccountCostDonut = lazy(() =>
+	import("@/features/apis/components/account-cost-donut").then((module) => ({
+		default: (props: AccountCostDonutProps) => <module.AccountCostDonut {...props} />,
+	})),
+);
+const ApiTrendChart = lazy(() =>
+	import("@/features/apis/components/api-trend-chart").then((module) => ({
+		default: (props: ApiTrendChartProps) => <module.ApiTrendChart {...props} />,
+	})),
+);
 
 export type ApiDetailProps = {
 	apiKey: ApiKey | null;
@@ -59,6 +72,7 @@ export function ApiDetail({
 	onRegenerate,
 	onToggleActive,
 }: ApiDetailProps) {
+	const { t } = useTranslation();
 	const [showAccumulated, setShowAccumulated] = useState(false);
 
 	const chartData = useMemo(() => {
@@ -82,10 +96,13 @@ export function ApiDetail({
 
 	const usageMessage = useMemo(() => {
 		if (usage7Day) return null;
-		if (usage7DayLoading) return "Loading 7-day usage...";
-		if (usage7DayError) return "7-day usage unavailable";
+		if (usage7DayLoading) return t("apis.detail.loadingUsage");
+		if (usage7DayError) return t("apis.detail.usageUnavailable");
 		return null;
-	}, [usage7Day, usage7DayError, usage7DayLoading]);
+	}, [t, usage7Day, usage7DayError, usage7DayLoading]);
+
+	const hasDonutData = usage7Day && usage7Day.accountCosts.length > 0;
+	const hasTrends = trends && (trends.cost.length > 0 || trends.tokens.length > 0);
 
 	if (!apiKey) {
 		return (
@@ -94,17 +111,14 @@ export function ApiDetail({
 					<KeyRound className="h-5 w-5 text-muted-foreground" />
 				</div>
 				<p className="mt-3 text-sm font-medium text-muted-foreground">
-					Select an API key
+					{t("apis.detail.emptyTitle")}
 				</p>
 				<p className="mt-1 text-xs text-muted-foreground/70">
-					Choose an API key from the list to view details.
+					{t("apis.detail.emptyDescription")}
 				</p>
 			</div>
 		);
 	}
-
-	const hasTrends =
-		trends && (trends.cost.length > 0 || trends.tokens.length > 0);
 
 	return (
 		<div
@@ -122,48 +136,82 @@ export function ApiDetail({
 							disabled={busy}
 						>
 							<Ellipsis className="size-4" />
-							<span className="sr-only">Actions</span>
+							<span className="sr-only">{t("apiKeys.table.actions")}</span>
 						</Button>
 					</DropdownMenuTrigger>
 					<DropdownMenuContent align="end">
 						<DropdownMenuItem onClick={() => onEdit(apiKey)}>
 							<Pencil className="size-4" />
-							Edit
+							{t("common.actions.edit")}
 						</DropdownMenuItem>
 						<DropdownMenuItem onClick={() => onRegenerate(apiKey)}>
 							<RefreshCw className="size-4" />
-							Regenerate
+							{t("common.actions.regenerate")}
 						</DropdownMenuItem>
 					</DropdownMenuContent>
 				</DropdownMenu>
 			</div>
 
-			<div className="space-y-4 rounded-lg border bg-muted/30 p-4">
-				<div className="flex items-center justify-end gap-3">
-					<div className="flex items-center gap-3 text-[10px] text-muted-foreground">
-						<span className="flex items-center gap-1.5">
-							Tokens
-							<span className="inline-block h-2 w-2 rounded-full bg-chart-2" />
-						</span>
-						<span className="flex items-center gap-1.5">
-							Cost
-							<span className="inline-block h-2 w-2 rounded-full bg-chart-1" />
-						</span>
-					</div>
-					<div className="flex items-center gap-1.5 rounded-md border px-2 py-1">
-						<span className="text-[10px]">Accumulated</span>
-						<Switch
-							size="sm"
-							checked={showAccumulated}
-							onCheckedChange={setShowAccumulated}
-						/>
-					</div>
+			{hasDonutData || hasTrends ? (
+				<div
+					className="rounded-xl border bg-card p-4 lg:flex lg:items-start"
+					data-testid="api-usage-panel"
+				>
+					{hasDonutData && (
+						<div className={hasTrends ? "lg:w-[25%] lg:shrink-0 lg:pr-4" : "lg:w-full"}>
+							<Suspense fallback={<div className="h-[240px]" />}>
+								<AccountCostDonut
+									accountCosts={usage7Day.accountCosts}
+									totalCostUsd={usage7Day.totalCostUsd}
+								/>
+							</Suspense>
+						</div>
+					)}
+					{hasTrends ? (
+						<div
+							className={
+								hasDonutData
+									? "mt-4 border-t pt-4 lg:mt-0 lg:max-w-[75%] lg:flex-1 lg:border-t-0 lg:border-l lg:pl-4 lg:pt-0"
+									: "lg:w-full"
+							}
+							data-testid="api-trend-panel"
+						>
+							<div className="mb-3 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+								<div>
+										<h3 className="text-sm font-semibold">{t("apis.detail.usageTrend")}</h3>
+										<p className="text-xs text-muted-foreground">{t("apis.detail.usageTrendDescription")}</p>
+								</div>
+								<div className="flex flex-wrap items-center justify-start gap-3 md:justify-end">
+									<div className="flex items-center gap-3 text-[10px] text-muted-foreground" data-testid="api-trend-legend">
+										<span className="flex items-center gap-1.5">
+												{t("apiKeys.limitTypes.total_tokens")}
+											<span className="inline-block h-2 w-2 rounded-full bg-chart-2" />
+										</span>
+										<span className="flex items-center gap-1.5">
+												{t("apiKeys.limitTypes.cost_usd")}
+											<span className="inline-block h-2 w-2 rounded-full bg-chart-1" />
+										</span>
+									</div>
+									<div className="flex items-center gap-1.5 rounded-md border px-2 py-1">
+											<span id="api-trend-accumulated-label" className="text-[10px]">{t("apis.detail.accumulated")}</span>
+										<Switch
+											size="sm"
+											aria-labelledby="api-trend-accumulated-label"
+											checked={showAccumulated}
+											onCheckedChange={setShowAccumulated}
+										/>
+									</div>
+								</div>
+							</div>
+							{chartData ? (
+								<Suspense fallback={<div className="h-[260px]" />}>
+									<ApiTrendChart cost={chartData.cost} tokens={chartData.tokens} />
+								</Suspense>
+							) : null}
+						</div>
+					) : null}
 				</div>
-
-				{hasTrends && chartData && (
-					<ApiTrendChart cost={chartData.cost} tokens={chartData.tokens} />
-				)}
-			</div>
+			) : null}
 
 			{usage7DayError ? (
 				<AlertMessage variant="error">{usage7DayError}</AlertMessage>
@@ -187,7 +235,7 @@ export function ApiDetail({
 						disabled={busy}
 					>
 						<Ellipsis className="h-3.5 w-3.5" />
-						Disable
+							{t("common.actions.disable")}
 					</Button>
 				) : (
 					<Button
@@ -198,7 +246,7 @@ export function ApiDetail({
 						disabled={busy}
 					>
 						<Play className="h-3.5 w-3.5" />
-						Enable
+							{t("common.actions.enable")}
 					</Button>
 				)}
 				<Button
@@ -210,7 +258,7 @@ export function ApiDetail({
 					disabled={busy}
 				>
 					<Trash2 className="h-3.5 w-3.5" />
-					Delete
+					{t("common.actions.delete")}
 				</Button>
 			</div>
 		</div>

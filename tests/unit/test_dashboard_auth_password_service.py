@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import bcrypt
 import pytest
 
+from app.core.auth.dashboard_access import DashboardPermission, DashboardRole
+from app.core.auth.dashboard_mode import DashboardAuthMode
 from app.modules.dashboard_auth.service import (
     DashboardAuthService,
     DashboardSessionStore,
@@ -19,6 +21,9 @@ pytestmark = pytest.mark.unit
 @dataclass(slots=True)
 class _FakeSettings:
     password_hash: str | None = None
+    guest_access_enabled: bool = False
+    guest_password_hash: str | None = None
+    dashboard_auth_mode: DashboardAuthMode = DashboardAuthMode.STANDARD
     totp_required_on_login: bool = False
     totp_secret_encrypted: bytes | None = None
     totp_last_verified_step: int | None = None
@@ -36,6 +41,14 @@ class _FakeRepository:
 
     async def set_password_hash(self, password_hash: str) -> _FakeSettings:
         self.settings.password_hash = password_hash
+        return self.settings
+
+    async def set_guest_password_hash(self, password_hash: str) -> _FakeSettings:
+        self.settings.guest_password_hash = password_hash
+        return self.settings
+
+    async def clear_guest_password_hash(self) -> _FakeSettings:
+        self.settings.guest_password_hash = None
         return self.settings
 
     async def try_set_password_hash(self, password_hash: str) -> bool:
@@ -108,6 +121,47 @@ async def test_verify_and_change_password() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_state_preserves_admin_without_password_when_guest_access_is_open() -> None:
+    repository = _FakeRepository()
+    repository.settings.guest_access_enabled = True
+    service = DashboardAuthService(repository, DashboardSessionStore())
+
+    session = await service.get_session_state(None)
+
+    assert session.authenticated is True
+    assert session.password_required is False
+    assert session.guest_access_enabled is True
+    assert session.guest_password_required is False
+    assert session.role == DashboardRole.ADMIN
+    assert session.permissions == [DashboardPermission.READ, DashboardPermission.WRITE]
+
+
+@pytest.mark.asyncio
+async def test_trusted_header_session_state_does_not_advertise_public_guest_without_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.modules.dashboard_auth.service as service_module
+
+    repository = _FakeRepository()
+    repository.settings.password_hash = "configured"
+    repository.settings.guest_access_enabled = True
+    monkeypatch.setattr(
+        service_module,
+        "get_settings",
+        lambda: _FakeSettings(dashboard_auth_mode=DashboardAuthMode.TRUSTED_HEADER),
+    )
+    service = DashboardAuthService(repository, DashboardSessionStore())
+
+    session = await service.get_session_state(None)
+
+    assert session.authenticated is False
+    assert session.guest_access_enabled is True
+    assert session.guest_password_required is False
+    assert session.role == DashboardRole.ADMIN
+    assert session.permissions == [DashboardPermission.READ, DashboardPermission.WRITE]
+
+
+@pytest.mark.asyncio
 async def test_remove_password_clears_password_and_totp() -> None:
     repository = _FakeRepository()
     service = DashboardAuthService(repository, DashboardSessionStore())
@@ -173,6 +227,52 @@ async def test_verify_totp_inherits_existing_password_session_expiry(monkeypatch
     assert state.password_verified is True
     assert state.totp_verified is True
     assert state.expires_at == current["value"] + expected_remaining
+
+
+@pytest.mark.asyncio
+async def test_verify_totp_caps_inherited_password_session_to_requested_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pyotp
+
+    import app.core.auth.totp as totp_module
+    import app.modules.dashboard_auth.service as service_module
+    from app.core.crypto import TokenEncryptor
+
+    current = {"value": 1_700_000_000}
+    monkeypatch.setattr(service_module, "time", lambda: current["value"])
+    monkeypatch.setattr(totp_module, "time", lambda: current["value"])
+
+    repository = _FakeRepository()
+    store = DashboardSessionStore()
+    service = DashboardAuthService(repository, store)
+    await service.setup_password("password123")
+
+    secret = pyotp.random_base32()
+    encryptor = TokenEncryptor()
+    repository.settings.totp_secret_encrypted = encryptor.encrypt(secret)
+
+    long_password_ttl = 365 * 24 * 60 * 60
+    remote_request_ttl = 12 * 60 * 60
+    password_session_id = store.create(
+        password_verified=True,
+        totp_verified=False,
+        ttl_seconds=long_password_ttl,
+    )
+
+    code = pyotp.TOTP(secret).at(current["value"])
+    new_session_id, applied_ttl = await service.verify_totp(
+        session_id=password_session_id,
+        code=code,
+        ttl_seconds=remote_request_ttl,
+    )
+
+    assert applied_ttl == remote_request_ttl
+    state = store.get(new_session_id)
+    assert state is not None
+    assert state.password_verified is True
+    assert state.totp_verified is True
+    assert state.expires_at == current["value"] + remote_request_ttl
 
 
 @pytest.mark.asyncio

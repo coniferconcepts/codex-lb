@@ -153,7 +153,9 @@ async def test_scheduler_sends_startup_and_interval_snapshots_with_one_undecided
     scheduler = TelemetryScheduler(sender=sender, interval_seconds=0.01)
     with caplog.at_level(logging.INFO, logger="app.modules.telemetry.scheduler"):
         await scheduler.start()
-        for _ in range(50):
+        # 50 polls (0.5 s) starve on a loaded x86_64 macOS host; 300 keeps the
+        # assertion intact while tolerating multi-second scheduler delays.
+        for _ in range(300):
             if sender.send_snapshot.await_count >= 2:
                 break
             await asyncio.sleep(0.01)

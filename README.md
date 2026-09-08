@@ -113,7 +113,9 @@ When accessing the dashboard remotely for the first time, a bootstrap token is r
 For this fork's local-first posture, prefer setting your own manual token if you need remote bootstrap:
 
 ```bash
+docker network inspect codex-lb-net >/dev/null 2>&1 || docker network create codex-lb-net
 docker run -d --name codex-lb \
+  --network codex-lb-net \
   -e CODEX_LB_BIND_HOST=0.0.0.0 \
   -e CODEX_LB_ALLOW_NONLOCAL_BIND=true \
   -e CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN=your-secret-token \
@@ -144,9 +146,11 @@ Open the dashboard → enter the token + new password → done. The token is sha
 **Manual token:** To use a fixed token instead, set the env var before starting:
 
 ```bash
+docker network inspect codex-lb-net >/dev/null 2>&1 || docker network create codex-lb-net
 docker run -d --name codex-lb \
+  --network codex-lb-net \
   -e CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN=your-secret-token \
-  -p 2455:2455 -p 1455:1455 \
+  -p 127.0.0.1:2455:2455 -p 127.0.0.1:1455:1455 \
   -v codex-lb-data:/var/lib/codex-lb \
   ghcr.io/soju06/codex-lb:latest
 ```

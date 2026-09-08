@@ -7,7 +7,7 @@ Regenerate with `uv run python scripts/generate_settings_reference.py`;
 `tests/unit/test_settings_reference.py` fails when this page drifts from
 `app/core/config/settings.py`.
 
-codex-lb currently exposes 131 settings. Every setting is an environment
+codex-lb currently exposes 133 settings. Every setting is an environment
 variable with the `CODEX_LB_` prefix (process environment or `.env` /
 `.env.local` next to the process). All defaults work with zero configuration —
 start from [Configuration](../configuration.md) for the handful that matter,
@@ -197,6 +197,7 @@ the host side of the compose `ports` mapping instead.
 | `CODEX_LB_DASHBOARD_AUTH_MODE` | `'standard' \| 'trusted_header' \| 'disabled'` | `'standard'` |
 | `CODEX_LB_DASHBOARD_AUTH_PROXY_HEADER` | `str` | `'Remote-User'` |
 | `CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN` | `str \| None` | `None` |
+| `CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN_EMIT_FULL` | `bool` | `False` |
 | `CODEX_LB_DASHBOARD_TRUST_LOOPBACK_HOST_HEADER_FOR_LONG_SESSIONS` | `bool` | `False` |
 
 ## Conversation archive
@@ -229,6 +230,7 @@ the host side of the compose `ports` mapping instead.
 | --- | --- | --- |
 | `CODEX_LB_LOG_FORMAT` | `str` | `'text'` |
 | `CODEX_LB_METRICS_ENABLED` | `bool` | `False` |
+| `CODEX_LB_METRICS_HOST` | `str` | `'127.0.0.1'` |
 | `CODEX_LB_METRICS_PORT` | `int` | `9090` |
 | `CODEX_LB_OTEL_ENABLED` | `bool` | `False` |
 | `CODEX_LB_OTEL_EXPORTER_ENDPOINT` | `str` | `''` |

@@ -141,7 +141,7 @@ class AccountsService:
             return []
         visible_account_ids = [account.id for account in accounts]
         account_id_set = set(visible_account_ids)
-        usage_account_ids = visible_account_ids if account_ids is not None else None
+        usage_account_ids = visible_account_ids
         primary_usage = (
             await self._usage_repo.latest_by_account(window="primary", account_ids=usage_account_ids)
             if self._usage_repo

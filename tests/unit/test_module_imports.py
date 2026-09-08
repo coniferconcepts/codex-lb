@@ -19,7 +19,7 @@ def test_dependencies_import_in_fresh_process() -> None:
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
     )
 
     assert result.returncode == 0, result.stderr

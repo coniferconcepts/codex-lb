@@ -219,7 +219,17 @@ async def test_latest_by_account_account_filter_matches_unfiltered_rows(db_setup
 
         unfiltered_usage = await usage_repo.latest_by_account(window="primary")
         scoped_usage = await usage_repo.latest_by_account(window="primary", account_ids=["acc1"])
-        assert scoped_usage == {"acc1": unfiltered_usage["acc1"]}
+        # The SQLite fast path returns detached snapshots, so row identity is
+        # not stable across calls; compare row values instead of objects.
+        assert set(unfiltered_usage) >= {"acc1"}
+        assert set(scoped_usage) == {"acc1"}
+        _u, _s = unfiltered_usage["acc1"], scoped_usage["acc1"]
+        assert (_s.id, _s.used_percent, _s.recorded_at, _s.window) == (
+            _u.id,
+            _u.used_percent,
+            _u.recorded_at,
+            _u.window,
+        )
 
         await additional_repo.add_entry(
             "acc1",
@@ -244,7 +254,15 @@ async def test_latest_by_account_account_filter_matches_unfiltered_rows(db_setup
             "primary",
             account_ids=["acc1"],
         )
-        assert scoped_additional == {"acc1": unfiltered_additional["acc1"]}
+        assert set(unfiltered_additional) >= {"acc1"}
+        assert set(scoped_additional) == {"acc1"}
+        _ua, _sa = unfiltered_additional["acc1"], scoped_additional["acc1"]
+        assert (_sa.id, _sa.used_percent, _sa.recorded_at, _sa.window) == (
+            _ua.id,
+            _ua.used_percent,
+            _ua.recorded_at,
+            _ua.window,
+        )
 
 
 @pytest.mark.asyncio

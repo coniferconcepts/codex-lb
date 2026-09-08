@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# Known load-flake (upstream, unchanged at v1.24.0): the terminal-cancellation
+# tests race real 50-150ms budgets against the host scheduler and fail roughly
+# 1 run in 3 under load on x86_64 macOS. Upstream is migrating these tests to
+# the VirtualClock/VirtualScheduler harness (PR #2103); do not loosen the
+# assertions here — retry isolated on failure.
+
 import asyncio
 import json
 import logging

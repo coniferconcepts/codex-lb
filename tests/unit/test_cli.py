@@ -548,7 +548,7 @@ def test_main_prefers_codex_lb_bind_host_env(monkeypatch):
     monkeypatch.setenv("CODEX_LB_BIND_HOST", "127.0.0.1")
     monkeypatch.setenv("HOST", "0.0.0.0")
     monkeypatch.setattr(sys, "argv", ["codex-lb"])
-    monkeypatch.setattr(cli.uvicorn, "run", fake_run)
+    monkeypatch.setattr(cli, "_run_server", fake_run)
 
     cli.main()
 
@@ -571,7 +571,7 @@ def test_main_allows_nonlocal_bind_with_explicit_override(monkeypatch):
 
     monkeypatch.setenv("CODEX_LB_ALLOW_NONLOCAL_BIND", "true")
     monkeypatch.setattr(sys, "argv", ["codex-lb", "--host", "0.0.0.0"])
-    monkeypatch.setattr(cli.uvicorn, "run", fake_run)
+    monkeypatch.setattr(cli, "_run_server", fake_run)
 
     cli.main()
 
@@ -642,7 +642,7 @@ def test_main_starts_listen_watch_and_stops_it(monkeypatch):
         captured["kwargs"] = kwargs
 
     monkeypatch.setattr(sys, "argv", ["codex-lb"])
-    monkeypatch.setattr(cli.uvicorn, "run", fake_run)
+    monkeypatch.setattr(cli, "_run_server", fake_run)
     monkeypatch.setenv("CODEX_LB_LISTEN_TIMEOUT_SECONDS", "30")
 
     cli.main()

@@ -47,6 +47,7 @@ def _make_usage_entry(entry_id: int, account_id: str, window: str, used_percent:
 class _AccountsRepositorySpy(AccountsRepository):
     def __init__(self, accounts: list[Account]) -> None:
         self._accounts = accounts
+        self._session = None
 
     async def list_accounts(self) -> list[Account]:
         return list(self._accounts)
@@ -56,6 +57,9 @@ class _AccountsRepositorySpy(AccountsRepository):
         account_ids: list[str] | None = None,
     ) -> dict[str, AccountRequestUsageSummary]:
         del account_ids
+        return {}
+
+    async def additional_quota_routing_policy_overrides(self) -> dict[str, str]:
         return {}
 
 
@@ -110,6 +114,7 @@ class _DashboardRepositorySpy(DashboardRepository):
         self._latest_usage = {
             "primary": {account_id: _make_usage_entry(1, account_id, "primary", 20.0)},
             "secondary": {account_id: _make_usage_entry(2, account_id, "secondary", 40.0)},
+            "monthly": {account_id: _make_usage_entry(3, account_id, "monthly", 60.0)},
         }
 
     async def list_accounts(self) -> list[Account]:
@@ -122,6 +127,17 @@ class _DashboardRepositorySpy(DashboardRepository):
     ) -> dict[str, UsageHistory]:
         self.latest_calls.append((window, list(account_ids) if account_ids is not None else None))
         return self._latest_usage[window]
+
+    async def latest_limit_warmups_by_account(self, account_ids: list[str]) -> dict[str, AccountLimitWarmup]:
+        return {}
+
+    async def aggregate_conversations_by_bucket(
+        self,
+        since: datetime,
+        bucket_seconds: int = 21600,
+    ) -> list[BucketConversationAggregate]:
+        del since, bucket_seconds
+        return []
 
     async def bulk_usage_history_since(
         self,
@@ -151,8 +167,22 @@ class _DashboardRepositorySpy(DashboardRepository):
             cost_usd=0.0,
         )
 
-    async def top_error_since(self, since: datetime) -> str | None:
-        del since
+    async def aggregate_activity_between(self, since: datetime, until: datetime) -> RequestActivityAggregate:
+        del since, until
+        return RequestActivityAggregate(
+            request_count=0,
+            error_count=0,
+            input_tokens=0,
+            output_tokens=0,
+            cached_input_tokens=0,
+            cost_usd=0.0,
+        )
+
+    async def top_error_between(self, since: datetime, until: datetime) -> str | None:
+        del since, until
+        return None
+
+    async def earliest_activity_at(self) -> datetime | None:
         return None
 
     async def latest_additional_recorded_at(self) -> datetime | None:
@@ -170,7 +200,11 @@ async def test_accounts_service_forwards_loaded_account_ids_to_all_latest_usage_
     await service.list_accounts()
 
     expected_ids = ["acc_a", "acc_b"]
-    assert usage_repo.latest_calls == [("primary", expected_ids), ("secondary", expected_ids)]
+    assert usage_repo.latest_calls == [
+        ("primary", expected_ids),
+        ("secondary", expected_ids),
+        ("monthly", expected_ids),
+    ]
     assert additional_repo.list_quota_keys_calls == [expected_ids]
     assert additional_repo.latest_calls == [
         ("codex_spark", "primary", expected_ids),
@@ -187,4 +221,8 @@ async def test_dashboard_service_forwards_loaded_account_ids_for_both_windows() 
     await service.get_overview()
 
     expected_ids = ["acc_dashboard"]
-    assert repo.latest_calls == [("primary", expected_ids), ("secondary", expected_ids)]
+    assert repo.latest_calls == [
+        ("primary", expected_ids),
+        ("secondary", expected_ids),
+        ("monthly", expected_ids),
+    ]

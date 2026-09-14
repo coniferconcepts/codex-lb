@@ -254,6 +254,41 @@ class LeaderElection:
         return self._is_leader
 
     async def try_acquire(self) -> bool:
+        from app.core.startup_budget import (
+            REASON_LEADER_LEASE,
+            StartupBudgetExceeded,
+            is_pre_listen_startup,
+            remaining_lifespan_budget_seconds,
+            run_within_startup_budget,
+        )
+
+        if not is_pre_listen_startup():
+            return await self._try_acquire_lease()
+        remaining = remaining_lifespan_budget_seconds()
+        try:
+            return await run_within_startup_budget(
+                self._try_acquire_lease(),
+                timeout_seconds=remaining,
+                reason=REASON_LEADER_LEASE,
+            )
+        except StartupBudgetExceeded:
+            loop = asyncio.get_running_loop()
+            if self._is_leader and self._lease_deadline is not None and loop.time() < self._lease_deadline:
+                logger.warning(
+                    "Leader lease acquisition exceeded remaining startup budget but the held lease is "
+                    "still valid; preserving leadership leader_id=%s",
+                    self._leader_id,
+                )
+                return True
+            logger.warning(
+                "Leader lease acquisition exceeded remaining startup budget; defaulting to non-leader leader_id=%s",
+                self._leader_id,
+            )
+            self._is_leader = False
+            self._lease_deadline = None
+            return False
+
+    async def _try_acquire_lease(self) -> bool:
         settings = get_settings()
         if not settings.leader_election_enabled:
             self._is_leader = True

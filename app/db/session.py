@@ -36,6 +36,18 @@ logger = logging.getLogger(__name__)
 
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _SQLITE_BUSY_TIMEOUT_SECONDS = _SQLITE_BUSY_TIMEOUT_MS / 1000
+
+
+def _effective_sqlite_busy_timeout_ms() -> int:
+    """Use the remaining pre-listen budget when a listen watcher is counting down."""
+    from app.core.startup_budget import sqlite_busy_timeout_seconds
+
+    seconds = sqlite_busy_timeout_seconds()
+    if seconds is None:
+        return _SQLITE_BUSY_TIMEOUT_MS
+    return max(50, int(seconds * 1000))
+
+
 # A write transaction holding SQLite's single writer slot past the busy
 # timeout is exactly the holder that makes every other writer surface
 # "database is locked" (issue #1682); the watchdog below reports it with the
@@ -176,7 +188,7 @@ def _configure_sqlite_engine(engine: Engine, *, enable_wal: bool) -> None:
                 cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+            cursor.execute(f"PRAGMA busy_timeout={_effective_sqlite_busy_timeout_ms()}")
         finally:
             cursor.close()
 
@@ -361,6 +373,60 @@ def _startup_sqlite_check_mode(raw_mode: str) -> SqliteIntegrityCheckMode | None
     if raw_mode == "off":
         return None
     return SqliteIntegrityCheckMode(raw_mode)
+
+
+async def run_sqlite_startup_integrity_check() -> None:
+    """Run the configured SQLite startup integrity pragma.
+
+    Call this after listen so a large database cannot consume the CLI listen
+    budget. ``init_db`` still runs it inline when no listen watcher is active
+    (tests, migrate CLI, non-sidecar entrypoints).
+    """
+    database_url = normalize_sqlite_url(_settings.database_url)
+    sqlite_path = sqlite_db_path_from_url(database_url)
+    if sqlite_path is None:
+        return
+    check_mode = _startup_sqlite_check_mode(_settings.database_sqlite_startup_check_mode)
+    if check_mode is None:
+        return
+    integrity = await to_thread.run_sync(
+        lambda: check_sqlite_integrity(sqlite_path, mode=check_mode),
+    )
+    if integrity.ok:
+        return
+    details = integrity.details or "unknown error"
+    pragma_name = "quick_check" if check_mode == SqliteIntegrityCheckMode.QUICK else "integrity_check"
+    logger.error(
+        "SQLite %s failed path=%s details=%s",
+        pragma_name,
+        sqlite_path,
+        details,
+    )
+    if "locked" in details.lower():
+        message = (
+            f"SQLite {pragma_name} failed for {sqlite_path} ({details}). "
+            "Another instance may be running. Stop it and retry."
+        )
+    else:
+        message = (
+            f"SQLite {pragma_name} failed for {sqlite_path} ({details}). "
+            "The database appears corrupted or the filesystem is unhealthy. "
+            "Stop the app and run "
+            f'`python -m app.db.recover --db "{sqlite_path}" --replace` '
+            "or restore a backup from the same directory."
+        )
+    raise RuntimeError(message)
+
+
+async def run_sqlite_startup_schema_drift_check() -> None:
+    """Compare Alembic metadata after listen so reflection cannot consume the listen budget."""
+    database_url = normalize_sqlite_url(_settings.database_url)
+    _, _, check_schema_drift = _load_migration_entrypoints()
+    drift = await to_thread.run_sync(lambda: check_schema_drift(database_url))
+    if not drift:
+        return
+    drift_details = "; ".join(drift)
+    raise RuntimeError(f"Schema drift detected after startup migrations: {drift_details}")
 
 
 async def _shielded(awaitable: Awaitable[object]) -> None:
@@ -842,35 +908,19 @@ async def init_db() -> None:
     _ensure_sqlite_dir(database_url)
     sqlite_path = sqlite_db_path_from_url(database_url)
     if sqlite_path is not None:
+        from app.core.startup_budget import is_pre_listen_startup
+
         check_mode = _startup_sqlite_check_mode(_settings.database_sqlite_startup_check_mode)
-        if check_mode is not None:
-            integrity = check_sqlite_integrity(sqlite_path, mode=check_mode)
-            if not integrity.ok:
-                details = integrity.details or "unknown error"
-                pragma_name = "quick_check" if check_mode == SqliteIntegrityCheckMode.QUICK else "integrity_check"
-                logger.error(
-                    "SQLite %s failed path=%s details=%s",
-                    pragma_name,
-                    sqlite_path,
-                    details,
-                )
-                if "locked" in details.lower():
-                    message = (
-                        f"SQLite {pragma_name} failed for {sqlite_path} ({details}). "
-                        "Another instance may be running. Stop it and retry."
-                    )
-                else:
-                    message = (
-                        f"SQLite {pragma_name} failed for {sqlite_path} ({details}). "
-                        "The database appears corrupted or the filesystem is unhealthy. "
-                        "Stop the app and run "
-                        f'`python -m app.db.recover --db "{sqlite_path}" --replace` '
-                        "or restore a backup from the same directory."
-                    )
-                raise RuntimeError(message)
+        if check_mode is not None and is_pre_listen_startup():
+            logger.info(
+                "Deferring SQLite startup integrity check until after listen so a large "
+                "database cannot consume the listen budget"
+            )
+        elif check_mode is not None:
+            await run_sqlite_startup_integrity_check()
 
     try:
-        inspect_migration_state, run_startup_migrations, check_schema_drift = _load_migration_entrypoints()
+        inspect_migration_state, run_startup_migrations, _check_schema_drift = _load_migration_entrypoints()
     except ModuleNotFoundError as exc:
         if exc.name != "app.db.migrate":
             raise
@@ -941,10 +991,12 @@ async def init_db() -> None:
             )
         if result.current_revision is not None:
             logger.info("Database migration complete revision=%s", result.current_revision)
-        drift = await to_thread.run_sync(lambda: check_schema_drift(database_url))
-        if drift:
-            drift_details = "; ".join(drift)
-            raise RuntimeError(f"Schema drift detected after startup migrations: {drift_details}")
+        from app.core.startup_budget import is_pre_listen_startup as _is_pre_listen
+
+        if _is_pre_listen():
+            logger.info("Deferring schema drift check until after listen")
+        else:
+            await run_sqlite_startup_schema_drift_check()
     except Exception:
         logger.exception("Failed to apply database migrations")
         if _settings.database_migrations_fail_fast:

@@ -7,18 +7,22 @@ import sqlite3
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.codex_sessions_retag import RetagResult, default_codex_home, retag_codex_sessions
-
 from app.core.bind_policy import assert_bind_host_allowed, resolve_allow_nonlocal_bind, resolve_bind_host
+from app.core.startup_budget import (
+    listen_timeout_seconds as _listen_timeout_seconds,
+)
+from app.core.startup_budget import (
+    mark_listen_watch_started,
+    release_startup_budget,
+)
 
 if TYPE_CHECKING:
     from app.core.runtime_logging import LogConfig
-
-DEFAULT_LISTEN_TIMEOUT_SECONDS = 30.0
 
 
 class _CliHelpFormatter(argparse.HelpFormatter):
@@ -125,19 +129,15 @@ def watch_listen_or_timeout(
     return "timeout"
 
 
-def _listen_timeout_seconds(environ: Mapping[str, str] = os.environ) -> float:
-    raw = (environ.get("CODEX_LB_LISTEN_TIMEOUT_SECONDS") or "").strip()
-    if not raw:
-        return DEFAULT_LISTEN_TIMEOUT_SECONDS
-    try:
-        value = float(raw)
-    except ValueError:
-        return DEFAULT_LISTEN_TIMEOUT_SECONDS
-    return value if value > 0 else DEFAULT_LISTEN_TIMEOUT_SECONDS
-
-
 def _exit_listen_timeout() -> None:
     print("category=fail_startup reason=listen_timeout", file=sys.stderr)
+    os._exit(1)
+
+
+def _exit_lifespan_budget_exceeded() -> None:
+    from app.core.startup_budget import REASON_STARTUP_BUDGET_EXCEEDED, format_fail_startup
+
+    print(format_fail_startup(REASON_STARTUP_BUDGET_EXCEEDED), file=sys.stderr, flush=True)
     os._exit(1)
 
 
@@ -165,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     stop = threading.Event()
     timeout_seconds = _listen_timeout_seconds()
+    mark_listen_watch_started()
     watcher = threading.Thread(
         target=watch_listen_or_timeout,
         kwargs={
@@ -192,6 +193,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     finally:
         stop.set()
+        release_startup_budget()
 
 
 def _load_uvicorn():

@@ -24,6 +24,12 @@ def _sync_database_url() -> str:
     return to_sync_database_url(get_settings().database_url)
 
 
+def _sqlite_connect_args(url: str) -> dict[str, object]:
+    from app.core.startup_budget import sqlalchemy_connect_args_for_url
+
+    return sqlalchemy_connect_args_for_url(url)
+
+
 def run_migrations_offline() -> None:
     url = _sync_database_url()
     config.set_main_option("sqlalchemy.url", url)
@@ -50,6 +56,7 @@ def run_migrations_online() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
         future=True,
+        connect_args=_sqlite_connect_args(section["sqlalchemy.url"]),
     )
 
     with connectable.connect() as connection:

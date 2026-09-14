@@ -653,6 +653,53 @@ async def test_init_db_uses_quick_check_by_default(monkeypatch, tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_init_db_defers_sqlite_check_during_pre_listen(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "store.db"
+    db_path.write_bytes(b"sqlite")
+    seen: list[SqliteIntegrityCheckMode] = []
+
+    def _check(path: Path, *, mode: SqliteIntegrityCheckMode = SqliteIntegrityCheckMode.FULL) -> IntegrityCheck:
+        seen.append(mode)
+        return IntegrityCheck(ok=True, details=None)
+
+    monkeypatch.setattr(
+        session_module,
+        "_settings",
+        _FakeSettings(
+            database_url=f"sqlite+aiosqlite:///{db_path}",
+            database_migrate_on_startup=False,
+        ),
+    )
+    monkeypatch.setattr(session_module, "check_sqlite_integrity", _check)
+    monkeypatch.setattr(
+        session_module,
+        "_load_migration_entrypoints",
+        lambda: (
+            lambda _: _FakeMigrationState(
+                current_revision="head",
+                head_revision="head",
+                has_alembic_version_table=True,
+                has_legacy_migrations_table=False,
+                needs_upgrade=False,
+            ),
+            lambda _: (_ for _ in ()).throw(AssertionError("startup migrations should stay disabled")),
+            lambda _: (),
+        ),
+    )
+
+    from app.core.startup_budget import mark_listen_watch_started, reset_startup_budget_for_tests
+
+    mark_listen_watch_started()
+    try:
+        await session_module.init_db()
+        assert seen == []
+        await session_module.run_sqlite_startup_integrity_check()
+        assert seen == [SqliteIntegrityCheckMode.QUICK]
+    finally:
+        reset_startup_budget_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_init_db_uses_full_check_when_configured(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "store.db"
     db_path.write_bytes(b"sqlite")

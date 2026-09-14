@@ -173,9 +173,19 @@ def _required_sqlalchemy_url(config: Config) -> str:
     return sync_database_url
 
 
+def _sqlite_connect_args(sync_database_url: str) -> dict[str, object]:
+    from app.core.startup_budget import sqlalchemy_connect_args_for_url
+
+    return sqlalchemy_connect_args_for_url(sync_database_url)
+
+
 @contextmanager
 def _sync_connection(sync_database_url: str) -> Iterator[Connection]:
-    engine = create_engine(sync_database_url, future=True)
+    engine = create_engine(
+        sync_database_url,
+        future=True,
+        connect_args=_sqlite_connect_args(sync_database_url),
+    )
     try:
         with engine.connect() as connection:
             yield connection
@@ -185,7 +195,11 @@ def _sync_connection(sync_database_url: str) -> Iterator[Connection]:
 
 @contextmanager
 def _sync_transaction(sync_database_url: str) -> Iterator[Connection]:
-    engine = create_engine(sync_database_url, future=True)
+    engine = create_engine(
+        sync_database_url,
+        future=True,
+        connect_args=_sqlite_connect_args(sync_database_url),
+    )
     try:
         with engine.begin() as connection:
             yield connection
@@ -748,13 +762,17 @@ def _run_upgrade_locked(
 
 
 async def run_startup_migrations(database_url: str) -> MigrationRunResult:
+    from app.core.startup_budget import migration_lock_timeout_seconds
+
     auto_remap = get_settings().database_alembic_auto_remap_enabled
+    lock_timeout = migration_lock_timeout_seconds()
     return await to_thread.run_sync(
         lambda: run_upgrade(
             database_url,
             "head",
             bootstrap_legacy=True,
             auto_remap_legacy_revisions=auto_remap,
+            lock_timeout_seconds=lock_timeout,
         ),
     )
 

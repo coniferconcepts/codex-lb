@@ -99,6 +99,28 @@ def _resolve_init_db_budget_wrapper() -> Callable[..., Any]:
     pytest.xfail("No init_db startup budget wrapper found on app.core.startup_budget (issue #7)")
 
 
+def test_exit_live_timeout_emits_typed_fail_startup_not_listen_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_exit(code: int) -> None:
+        captured["code"] = code
+        raise SystemExit(code)
+
+    monkeypatch.setattr(cli.os, "_exit", fake_exit)
+
+    with pytest.raises(SystemExit):
+        cli._exit_live_timeout()
+
+    stderr = capsys.readouterr().err
+    assert "category=fail_startup" in stderr
+    assert "reason=live_timeout" in stderr
+    assert "reason=listen_timeout" not in stderr
+    assert captured["code"] == 1
+
+
 def test_exit_listen_timeout_emits_canonical_fail_startup_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

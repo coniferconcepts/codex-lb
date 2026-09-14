@@ -31,6 +31,8 @@ REASON_STARTUP_BUDGET_EXCEEDED = "startup_budget"
 REASON_DB_MIGRATE = "db_migrate"
 REASON_LEADER_LEASE = "leader_lease"
 REASON_LISTEN_TIMEOUT = "listen_timeout"
+REASON_LIVE_TIMEOUT = "live_timeout"
+REASON_LIVE_HUNG = "live_hung"
 
 _T = TypeVar("_T")
 

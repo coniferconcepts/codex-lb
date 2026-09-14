@@ -578,6 +578,10 @@ def test_main_allows_nonlocal_bind_with_explicit_override(monkeypatch):
     assert captured["kwargs"]["host"] == "0.0.0.0"
 
 
+def test_live_is_healthy_false_when_connection_refused() -> None:
+    assert cli.live_is_healthy("127.0.0.1", 9, timeout=0.2) is False
+
+
 def test_watch_listen_or_timeout_returns_listening() -> None:
     seen: list[str] = []
 
@@ -590,6 +594,7 @@ def test_watch_listen_or_timeout_returns_listening() -> None:
         port=2455,
         timeout_seconds=1,
         is_listening=is_listening,
+        is_live_healthy=lambda host, port: True,
         sleep=lambda _: None,
         monotonic=lambda: 0.0,
         should_stop=lambda: False,
@@ -597,6 +602,61 @@ def test_watch_listen_or_timeout_returns_listening() -> None:
     )
     assert result == "listening"
     assert seen == ["127.0.0.1:2455"]
+
+
+def test_watch_listen_or_timeout_tcp_without_live_is_live_timeout() -> None:
+    fired = {"n": 0}
+    ticks = {"n": 0}
+
+    def monotonic() -> float:
+        ticks["n"] += 1
+        return 0.0 if ticks["n"] < 3 else 10.0
+
+    result = cli.watch_listen_or_timeout(
+        host="127.0.0.1",
+        port=9,
+        timeout_seconds=1,
+        is_listening=lambda host, port: True,
+        is_live_healthy=lambda host, port: False,
+        sleep=lambda _: None,
+        monotonic=monotonic,
+        should_stop=lambda: False,
+        on_timeout=lambda: pytest.fail("listen_timeout should not fire when TCP is up"),
+        on_live_timeout=lambda: fired.__setitem__("n", fired["n"] + 1),
+    )
+    assert result == "live_timeout"
+    assert fired["n"] == 1
+
+
+def test_watch_listen_or_timeout_keep_watching_exits_on_live_hang() -> None:
+    fired = {"n": 0}
+    ticks = {"n": 0}
+    live_ok = {"n": 0}
+
+    def monotonic() -> float:
+        ticks["n"] += 1
+        return float(ticks["n"])
+
+    def is_live_healthy(host: str, port: int) -> bool:
+        live_ok["n"] += 1
+        return live_ok["n"] == 1
+
+    result = cli.watch_listen_or_timeout(
+        host="127.0.0.1",
+        port=9,
+        timeout_seconds=100,
+        is_listening=lambda host, port: True,
+        is_live_healthy=is_live_healthy,
+        sleep=lambda _: None,
+        monotonic=monotonic,
+        should_stop=lambda: False,
+        on_timeout=lambda: pytest.fail("listen_timeout should not fire"),
+        on_live_hang=lambda: fired.__setitem__("n", fired["n"] + 1),
+        keep_watching_after_live=True,
+        live_hang_seconds=2,
+    )
+    assert result == "live_hung"
+    assert fired["n"] == 1
 
 
 def test_watch_listen_or_timeout_calls_on_timeout() -> None:
@@ -643,6 +703,8 @@ def test_main_starts_listen_watch_and_stops_it(monkeypatch):
 
     monkeypatch.setattr(sys, "argv", ["codex-lb"])
     monkeypatch.setattr(cli, "_run_server", fake_run)
+    monkeypatch.setattr(cli, "port_is_listening", lambda host, port: False)
+    monkeypatch.setattr(cli, "live_is_healthy", lambda host, port: False)
     monkeypatch.setenv("CODEX_LB_LISTEN_TIMEOUT_SECONDS", "30")
 
     cli.main()

@@ -60,17 +60,29 @@ from app.core.retention.scheduler import build_data_retention_scheduler
 from app.core.scheduling.leader_election import get_leader_election
 from app.core.shutdown import close_control_plane_task_admission
 from app.core.startup_budget import (
+    REASON_DB_MIGRATE,
+    REASON_STARTUP_BUDGET_EXCEEDED,
     StartupBudgetExceeded,
     exit_startup_budget_exceeded,
     init_db_within_startup_budget,
     mark_listen_watch_started,
     mark_pre_listen_complete,
+    set_startup_phase,
+    start_startup_budget_watch,
 )
 from app.core.timeout_invariants import validate_runtime_timeout_invariants
 from app.core.usage.refresh_scheduler import build_usage_refresh_scheduler
 from app.core.usage.reset_credits_refresh_scheduler import build_rate_limit_reset_credits_scheduler
 from app.core.utils.time import utcnow
-from app.db.session import SessionLocal, close_db, close_session, init_background_db, init_db
+from app.db.session import (
+    SessionLocal,
+    close_db,
+    close_session,
+    init_background_db,
+    init_db,
+    run_sqlite_startup_integrity_check,
+    run_sqlite_startup_schema_drift_check,
+)
 from app.modules.accounts import api as accounts_api
 from app.modules.accounts.deletion import build_account_deletion_scheduler
 from app.modules.accounts.repository import AccountsRepository
@@ -333,6 +345,8 @@ async def lifespan(app: FastAPI):
     heartbeat_task: asyncio.Task[None] | None = None
     instance_id = None
 
+    start_startup_budget_watch()
+    set_startup_phase(REASON_DB_MIGRATE)
     shutdown_state.prepare_lifespan_start()
     startup_module._startup_complete = False
     startup_module.reset_bridge_registration()
@@ -352,6 +366,7 @@ async def lifespan(app: FastAPI):
         await init_db_within_startup_budget(init_db=init_db)
     except StartupBudgetExceeded as exc:
         exit_startup_budget_exceeded(exc.reason)
+    set_startup_phase(REASON_STARTUP_BUDGET_EXCEEDED)
     init_background_db()
     await verify_encryption_key_fingerprint()
     _auto_bootstrap_token = await ensure_auto_bootstrap_token()
@@ -633,6 +648,18 @@ async def lifespan(app: FastAPI):
         )
     startup_module._startup_complete = True
     mark_pre_listen_complete()
+
+    async def _run_post_listen_sqlite_checks() -> None:
+        try:
+            await run_sqlite_startup_integrity_check()
+        except Exception:
+            logger.exception("Post-listen SQLite startup integrity check failed")
+        try:
+            await run_sqlite_startup_schema_drift_check()
+        except Exception:
+            logger.exception("Post-listen schema drift check failed")
+
+    asyncio.create_task(_run_post_listen_sqlite_checks())
 
     try:
         yield

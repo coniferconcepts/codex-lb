@@ -5,6 +5,10 @@ the process never binds the port. Lifespan work that can block on SQLite or
 leader-election MUST finish or fail inside the same ``CODEX_LB_LISTEN_TIMEOUT_SECONDS``
 window, minus a short margin so this module can log and ``os._exit`` before the
 watcher prints the opaque ``listen_timeout`` line.
+
+``start_startup_budget_watch`` covers the whole pre-yield window, including
+sync work that would otherwise freeze ``asyncio.wait``. Start it from lifespan
+only so a uvicorn hang before lifespan still emits ``listen_timeout``.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TypeVar
@@ -31,6 +36,10 @@ _T = TypeVar("_T")
 
 _watch_started_at: float | None = None
 _pre_listen_complete: bool = False
+_phase_reason: str = REASON_STARTUP_BUDGET_EXCEEDED
+_budget_watch_started: bool = False
+_budget_watch_thread: threading.Thread | None = None
+_budget_watch_stop = threading.Event()
 
 
 class StartupBudgetExceeded(TimeoutError):
@@ -84,13 +93,72 @@ def mark_pre_listen_complete() -> None:
     """Restore default SQLite busy_timeout after the server may bind."""
     global _pre_listen_complete
     _pre_listen_complete = True
+    _budget_watch_stop.set()
+
+
+def set_startup_phase(reason: str) -> None:
+    """Record which typed fail_startup reason the budget watch should emit."""
+    global _phase_reason
+    _phase_reason = reason
+
+
+def start_startup_budget_watch() -> None:
+    """Fail closed if pre-listen work blocks the event loop until listen_timeout.
+
+    The asyncio ``init_db`` wrapper cannot fire while a sync SQLite integrity
+    check (or later lifespan work) owns the loop. This daemon thread still
+    ``os._exit``s with the current phase at ``timeout - margin``. Start it from
+    lifespan only: a uvicorn hang before lifespan must keep ``listen_timeout``.
+    """
+    global _budget_watch_started, _budget_watch_thread
+    mark_listen_watch_started()
+    if _budget_watch_started:
+        return
+    _budget_watch_started = True
+    _budget_watch_stop.clear()
+    thread = threading.Thread(
+        target=_startup_budget_watch_loop,
+        name="codex-lb-startup-budget",
+        daemon=True,
+    )
+    _budget_watch_thread = thread
+    thread.start()
+
+
+def _startup_budget_watch_loop() -> None:
+    timeout = listen_timeout_seconds()
+    margin = listen_watcher_margin_seconds(timeout)
+    started = _watch_started_at
+    if started is None:  # pragma: no cover - start_startup_budget_watch always marks
+        started = time.monotonic()
+    deadline = started + timeout - margin
+    while True:
+        if _pre_listen_complete or _budget_watch_stop.is_set():
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        _budget_watch_stop.wait(timeout=min(_MIN_PHASE_SECONDS, remaining))
+    if _pre_listen_complete or _budget_watch_stop.is_set():
+        return
+    exit_startup_budget_exceeded(_phase_reason)
 
 
 def release_startup_budget() -> None:
     """Forget the listen-watch clock after the process stops serving (and in tests)."""
-    global _watch_started_at, _pre_listen_complete
+    global _watch_started_at, _pre_listen_complete, _budget_watch_started
+    global _budget_watch_thread, _phase_reason
+    _budget_watch_stop.set()
+    _pre_listen_complete = True
+    thread = _budget_watch_thread
+    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=0.5)
+    _budget_watch_thread = None
     _watch_started_at = None
+    _budget_watch_started = False
+    _phase_reason = REASON_STARTUP_BUDGET_EXCEEDED
     _pre_listen_complete = False
+    _budget_watch_stop.clear()
 
 
 def reset_startup_budget_for_tests() -> None:

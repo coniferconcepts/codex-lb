@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 from typing import Any, Callable
 
@@ -290,3 +291,68 @@ async def test_try_acquire_within_startup_budget_returns_false_instead_of_hangin
 
     assert acquired is False
     assert elapsed < 1.5
+
+
+def test_startup_budget_watch_beats_listen_timeout_when_caller_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Post-init_db pre-yield work must not sit until the CLI listen watcher."""
+    fired = threading.Event()
+    codes: list[int] = []
+
+    def fake_exit(code: int) -> None:
+        codes.append(code)
+        fired.set()
+
+    monkeypatch.setenv("CODEX_LB_LISTEN_TIMEOUT_SECONDS", "0.4")
+    monkeypatch.setattr(startup_budget_module.os, "_exit", fake_exit)
+    startup_budget_module.mark_listen_watch_started()
+    startup_budget_module.set_startup_phase(startup_budget_module.REASON_STARTUP_BUDGET_EXCEEDED)
+    startup_budget_module.start_startup_budget_watch()
+    time.sleep(2.0)
+
+    assert fired.wait(0.1)
+    assert codes == [1]
+    stderr = capsys.readouterr().err
+    assert "category=fail_startup reason=startup_budget" in stderr
+    assert "reason=listen_timeout" not in stderr
+
+
+def test_startup_budget_watch_emits_db_migrate_while_init_db_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fired = threading.Event()
+
+    def fake_exit(_code: int) -> None:
+        fired.set()
+
+    monkeypatch.setenv("CODEX_LB_LISTEN_TIMEOUT_SECONDS", "0.4")
+    monkeypatch.setattr(startup_budget_module.os, "_exit", fake_exit)
+    startup_budget_module.mark_listen_watch_started()
+    startup_budget_module.set_startup_phase(startup_budget_module.REASON_DB_MIGRATE)
+    startup_budget_module.start_startup_budget_watch()
+
+    assert fired.wait(2.0)
+    stderr = capsys.readouterr().err
+    assert "category=fail_startup reason=db_migrate" in stderr
+    assert "reason=listen_timeout" not in stderr
+
+
+def test_startup_budget_watch_does_not_exit_after_pre_listen_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fired = threading.Event()
+
+    def fake_exit(_code: int) -> None:
+        fired.set()
+
+    monkeypatch.setenv("CODEX_LB_LISTEN_TIMEOUT_SECONDS", "0.4")
+    monkeypatch.setattr(startup_budget_module.os, "_exit", fake_exit)
+    startup_budget_module.mark_listen_watch_started()
+    startup_budget_module.start_startup_budget_watch()
+    startup_budget_module.mark_pre_listen_complete()
+    time.sleep(0.8)
+
+    assert not fired.is_set()

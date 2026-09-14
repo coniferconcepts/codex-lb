@@ -21,8 +21,16 @@ class SqliteIntegrityCheckMode(str, Enum):
 
 
 @contextmanager
-def sqlite_connection(path: str | Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(str(path))
+def sqlite_connection(path: str | Path, *, timeout: float | None = None) -> Iterator[sqlite3.Connection]:
+    connect_timeout = timeout
+    if connect_timeout is None:
+        from app.core.startup_budget import sqlite_busy_timeout_seconds
+
+        connect_timeout = sqlite_busy_timeout_seconds()
+    if connect_timeout is None:
+        connection = sqlite3.connect(str(path))
+    else:
+        connection = sqlite3.connect(str(path), timeout=connect_timeout)
     try:
         with connection:
             yield connection

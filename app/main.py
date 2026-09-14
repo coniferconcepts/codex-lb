@@ -59,6 +59,13 @@ from app.core.resilience.memory_monitor import configure as configure_memory_mon
 from app.core.retention.scheduler import build_data_retention_scheduler
 from app.core.scheduling.leader_election import get_leader_election
 from app.core.shutdown import close_control_plane_task_admission
+from app.core.startup_budget import (
+    StartupBudgetExceeded,
+    exit_startup_budget_exceeded,
+    init_db_within_startup_budget,
+    mark_listen_watch_started,
+    mark_pre_listen_complete,
+)
 from app.core.timeout_invariants import validate_runtime_timeout_invariants
 from app.core.usage.refresh_scheduler import build_usage_refresh_scheduler
 from app.core.usage.reset_credits_refresh_scheduler import build_rate_limit_reset_credits_scheduler
@@ -340,7 +347,11 @@ async def lifespan(app: FastAPI):
     # accounts instead of all herding onto the lexicographically-first account.
     configure_replica_salt(settings.http_responses_session_bridge_instance_id)
     bridge_endpoint_base_url = settings.http_responses_session_bridge_advertise_base_url
-    await init_db()
+    mark_listen_watch_started()
+    try:
+        await init_db_within_startup_budget(init_db=init_db)
+    except StartupBudgetExceeded as exc:
+        exit_startup_budget_exceeded(exc.reason)
     init_background_db()
     await verify_encryption_key_fingerprint()
     _auto_bootstrap_token = await ensure_auto_bootstrap_token()
@@ -621,10 +632,12 @@ async def lifespan(app: FastAPI):
             )
         )
     startup_module._startup_complete = True
+    mark_pre_listen_complete()
 
     try:
         yield
     finally:
+        mark_pre_listen_complete()
         shutdown_state.commit_shutdown(timeout_seconds=settings.shutdown_drain_timeout_seconds)
         remaining_drain_seconds = shutdown_state.remaining_drain_timeout_seconds() or 0.0
         drained = await shutdown_state.wait_for_in_flight_drain(timeout_seconds=remaining_drain_seconds)

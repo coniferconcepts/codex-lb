@@ -36,6 +36,18 @@ logger = logging.getLogger(__name__)
 
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _SQLITE_BUSY_TIMEOUT_SECONDS = _SQLITE_BUSY_TIMEOUT_MS / 1000
+
+
+def _effective_sqlite_busy_timeout_ms() -> int:
+    """Use the remaining pre-listen budget when a listen watcher is counting down."""
+    from app.core.startup_budget import sqlite_busy_timeout_seconds
+
+    seconds = sqlite_busy_timeout_seconds()
+    if seconds is None:
+        return _SQLITE_BUSY_TIMEOUT_MS
+    return max(50, int(seconds * 1000))
+
+
 # A write transaction holding SQLite's single writer slot past the busy
 # timeout is exactly the holder that makes every other writer surface
 # "database is locked" (issue #1682); the watchdog below reports it with the
@@ -176,7 +188,7 @@ def _configure_sqlite_engine(engine: Engine, *, enable_wal: bool) -> None:
                 cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+            cursor.execute(f"PRAGMA busy_timeout={_effective_sqlite_busy_timeout_ms()}")
         finally:
             cursor.close()
 

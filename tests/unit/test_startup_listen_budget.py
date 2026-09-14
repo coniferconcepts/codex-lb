@@ -19,8 +19,17 @@ from typing import Any, Callable
 import pytest
 
 from app import cli
+from app.core import startup_budget as startup_budget_module
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _reset_startup_budget() -> None:
+    startup_budget_module.reset_startup_budget_for_tests()
+    yield
+    startup_budget_module.reset_startup_budget_for_tests()
+
 
 _CANONICAL_LISTEN_TIMEOUT_LINE = "category=fail_startup reason=listen_timeout"
 
@@ -63,9 +72,7 @@ def _resolve_lifespan_exit_helper() -> tuple[Callable[[], None], str]:
         candidate = getattr(startup_budget, name, None)
         if callable(candidate):
             return candidate, f"startup_budget.{name}"
-    pytest.xfail(
-        "No lifespan startup budget exit helper found on app.cli or app.core.startup_budget (issue #7)"
-    )
+    pytest.xfail("No lifespan startup budget exit helper found on app.cli or app.core.startup_budget (issue #7)")
 
 
 def _resolve_lifespan_budget_reason() -> str:
@@ -79,9 +86,7 @@ def _resolve_lifespan_budget_reason() -> str:
         sample = formatter("lifespan_budget_exceeded")
         if "reason=lifespan_budget_exceeded" in sample:
             return "lifespan_budget_exceeded"
-    pytest.xfail(
-        "No lifespan budget fail_startup reason constant found on app.core.startup_budget (issue #7)"
-    )
+    pytest.xfail("No lifespan budget fail_startup reason constant found on app.core.startup_budget (issue #7)")
 
 
 def _resolve_init_db_budget_wrapper() -> Callable[..., Any]:
@@ -90,9 +95,7 @@ def _resolve_init_db_budget_wrapper() -> Callable[..., Any]:
         candidate = getattr(startup_budget, name, None)
         if callable(candidate):
             return candidate
-    pytest.xfail(
-        "No init_db startup budget wrapper found on app.core.startup_budget (issue #7)"
-    )
+    pytest.xfail("No init_db startup budget wrapper found on app.core.startup_budget (issue #7)")
 
 
 def test_exit_listen_timeout_emits_canonical_fail_startup_line(
@@ -171,8 +174,11 @@ async def test_init_db_wrapper_fails_within_listen_budget_when_init_db_blocks(
     if budget_exc_type is None:
         pytest.xfail("StartupBudgetExceeded not defined on app.core.startup_budget (issue #7)")
 
-    with pytest.raises(budget_exc_type):
+    with pytest.raises(budget_exc_type) as exc_info:
         await wrapper(budget_seconds=budget_seconds)
+
+    assert exc_info.value.reason == startup_budget_module.REASON_DB_MIGRATE
+    assert exc_info.value.reason != "listen_timeout"
 
     elapsed = time.monotonic() - started
     assert elapsed < budget_seconds + 0.35, (
@@ -186,11 +192,7 @@ def test_subprocess_listen_never_happens_stderr_matches_fail_startup_contract(
     """Characterization aligned with tests/unit/test_cli.py; do not weaken the contract."""
     hang = tmp_path / "hang_uvicorn.py"
     hang.write_text(
-        "import time\n"
-        "import uvicorn\n"
-        "def run(*args, **kwargs):\n"
-        "    time.sleep(8)\n"
-        "uvicorn.run = run\n",
+        "import time\nimport uvicorn\ndef run(*args, **kwargs):\n    time.sleep(8)\nuvicorn.run = run\n",
         encoding="utf-8",
     )
     import os
@@ -209,9 +211,7 @@ def test_subprocess_listen_never_happens_stderr_matches_fail_startup_contract(
         [
             sys.executable,
             "-c",
-            "import hang_uvicorn, sys; "
-            f"sys.argv=['codex-lb','--port','{free_port}']; "
-            "from app.cli import main; main()",
+            f"import hang_uvicorn, sys; sys.argv=['codex-lb','--port','{free_port}']; from app.cli import main; main()",
         ],
         cwd=str(root),
         env=env,
@@ -221,3 +221,72 @@ def test_subprocess_listen_never_happens_stderr_matches_fail_startup_contract(
     )
     assert result.returncode == 1
     assert _CANONICAL_LISTEN_TIMEOUT_LINE in result.stderr
+
+
+def test_default_listen_timeout_seconds_is_unchanged() -> None:
+    assert startup_budget_module.DEFAULT_LISTEN_TIMEOUT_SECONDS == 30.0
+    assert startup_budget_module.listen_timeout_seconds({}) == 30.0
+    assert startup_budget_module.listen_timeout_seconds({"CODEX_LB_LISTEN_TIMEOUT_SECONDS": "90"}) == 90.0
+
+    assert startup_budget_module.REASON_DB_MIGRATE != "listen_timeout"
+    assert startup_budget_module.format_fail_startup(startup_budget_module.REASON_DB_MIGRATE) == (
+        "category=fail_startup reason=db_migrate"
+    )
+    assert startup_budget_module.format_fail_startup(startup_budget_module.REASON_STARTUP_BUDGET_EXCEEDED) == (
+        "category=fail_startup reason=startup_budget"
+    )
+
+
+@pytest.mark.asyncio
+async def test_locked_sqlite_busy_wait_cannot_overrun_startup_budget(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from app.db.sqlite_utils import check_sqlite_integrity
+
+    db_path = tmp_path / "locked.db"
+    bootstrap = sqlite3.connect(str(db_path))
+    bootstrap.execute("CREATE TABLE t(x INTEGER)")
+    bootstrap.commit()
+    bootstrap.close()
+
+    holder = sqlite3.connect(str(db_path), timeout=0, isolation_level=None)
+    holder.execute("PRAGMA journal_mode=DELETE")
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        monkeypatch.setenv("CODEX_LB_LISTEN_TIMEOUT_SECONDS", "1")
+        startup_budget_module.mark_listen_watch_started()
+        busy_timeout = startup_budget_module.sqlite_busy_timeout_seconds()
+        assert busy_timeout is not None
+        assert busy_timeout <= 1.0
+
+        started = time.monotonic()
+        result = await asyncio.to_thread(check_sqlite_integrity, db_path)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.close()
+
+    assert elapsed < 2.5, "contended SQLite must not wait out the 30s app busy_timeout"
+    assert result.ok is False
+    details = (result.details or "").lower()
+    assert "locked" in details or "busy" in details
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_within_startup_budget_returns_false_instead_of_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_acquire() -> bool:
+        await asyncio.sleep(5.0)
+        return True
+
+    monkeypatch.setenv("CODEX_LB_LISTEN_TIMEOUT_SECONDS", "0.4")
+    startup_budget_module.mark_listen_watch_started()
+    started = time.monotonic()
+    acquired = await startup_budget_module.try_acquire_within_startup_budget(slow_acquire)
+    elapsed = time.monotonic() - started
+
+    assert acquired is False
+    assert elapsed < 1.5

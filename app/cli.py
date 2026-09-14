@@ -7,7 +7,9 @@ import sqlite3
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -94,6 +96,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+DEFAULT_LIVE_HANG_SECONDS = 60.0
+LIVE_PROBE_TIMEOUT_SECONDS = 1.0
+LIVE_PROBE_BODY_LIMIT_BYTES = 4096
+
+
 def port_is_listening(host: str, port: int, timeout: float = 0.3) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
@@ -105,32 +112,108 @@ def port_is_listening(host: str, port: int, timeout: float = 0.3) -> bool:
         sock.close()
 
 
+def live_hang_seconds(environ: Mapping[str, str] | None = None) -> float:
+    raw = ((environ or os.environ).get("CODEX_LB_LIVE_HANG_SECONDS") or "").strip()
+    if not raw:
+        return DEFAULT_LIVE_HANG_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_LIVE_HANG_SECONDS
+    return value if value > 0 else DEFAULT_LIVE_HANG_SECONDS
+
+
+def _loopback_live_url(host: str, port: int) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"http://[{host}]:{port}/health/live"
+    return f"http://{host}:{port}/health/live"
+
+
+def live_is_healthy(host: str, port: int, timeout: float = LIVE_PROBE_TIMEOUT_SECONDS) -> bool:
+    """GET /health/live from a thread. Must not use the app event loop."""
+    url = _loopback_live_url(host, port)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as resp:
+            status = int(getattr(resp, "status", None) or resp.getcode())
+            if status < 200 or status >= 300:
+                return False
+            return bool(resp.read(LIVE_PROBE_BODY_LIMIT_BYTES))
+    except (OSError, urllib.error.URLError, ValueError):
+        return False
+
+
 def watch_listen_or_timeout(
     *,
     host: str,
     port: int,
     timeout_seconds: float,
     is_listening: Callable[[str, int], bool] = port_is_listening,
+    is_live_healthy: Callable[[str, int], bool] = live_is_healthy,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     should_stop: Callable[[], bool],
     on_timeout: Callable[[], None],
+    on_live_timeout: Callable[[], None] | None = None,
+    on_live_hang: Callable[[], None] | None = None,
+    keep_watching_after_live: bool = False,
+    live_hang_seconds: float | None = None,
 ) -> str:
+    """Wait for TCP listen AND /health/live 2xx. TCP-only is not success.
+
+    After the first live 2xx, optionally keep probing so a later event-loop
+    hang exits instead of remaining launchd-owned.
+    """
     deadline = monotonic() + timeout_seconds
-    while monotonic() < deadline:
+    saw_listen = False
+    last_live_ok: float | None = None
+    hang_budget = DEFAULT_LIVE_HANG_SECONDS if live_hang_seconds is None else live_hang_seconds
+    live_fail = on_live_timeout or on_timeout
+    hang_fail = on_live_hang or on_live_timeout or on_timeout
+    while True:
+        now = monotonic()
         if should_stop():
             return "stopped"
-        if is_listening(host, port):
-            return "listening"
+        listening = is_listening(host, port)
+        live_ok = False
+        if listening:
+            saw_listen = True
+            live_ok = is_live_healthy(host, port)
+        if live_ok:
+            last_live_ok = now
+            if not keep_watching_after_live:
+                return "listening"
+        elif last_live_ok is None:
+            if now >= deadline:
+                if should_stop():
+                    return "stopped"
+                if saw_listen:
+                    live_fail()
+                    return "live_timeout"
+                on_timeout()
+                return "timeout"
+        elif hang_budget > 0 and now - last_live_ok >= hang_budget:
+            hang_fail()
+            return "live_hung"
         sleep(min(0.2, max(0.05, timeout_seconds / 10)))
-    if should_stop():
-        return "stopped"
-    on_timeout()
-    return "timeout"
 
 
 def _exit_listen_timeout() -> None:
     print("category=fail_startup reason=listen_timeout", file=sys.stderr)
+    os._exit(1)
+
+
+def _exit_live_timeout() -> None:
+    from app.core.startup_budget import REASON_LIVE_TIMEOUT, format_fail_startup
+
+    print(format_fail_startup(REASON_LIVE_TIMEOUT), file=sys.stderr, flush=True)
+    os._exit(1)
+
+
+def _exit_live_hung() -> None:
+    from app.core.startup_budget import REASON_LIVE_HUNG, format_fail_startup
+
+    print(format_fail_startup(REASON_LIVE_HUNG), file=sys.stderr, flush=True)
     os._exit(1)
 
 
@@ -174,6 +257,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "timeout_seconds": timeout_seconds,
             "should_stop": stop.is_set,
             "on_timeout": _exit_listen_timeout,
+            "on_live_timeout": _exit_live_timeout,
+            "on_live_hang": _exit_live_hung,
+            "keep_watching_after_live": True,
+            "live_hang_seconds": live_hang_seconds(),
         },
         name="codex-lb-listen-watch",
         daemon=True,

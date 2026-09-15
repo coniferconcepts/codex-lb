@@ -13,7 +13,6 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from app.codex_sessions_retag import RetagResult, default_codex_home, retag_codex_sessions
 from app.core.bind_policy import assert_bind_host_allowed, resolve_allow_nonlocal_bind, resolve_bind_host
 from app.core.startup_budget import (
     listen_timeout_seconds as _listen_timeout_seconds,
@@ -24,6 +23,7 @@ from app.core.startup_budget import (
 )
 
 if TYPE_CHECKING:
+    from app.codex_sessions_retag import RetagResult
     from app.core.runtime_logging import LogConfig
 
 
@@ -199,7 +199,7 @@ def watch_listen_or_timeout(
 
 
 def _exit_listen_timeout() -> None:
-    print("category=fail_startup reason=listen_timeout", file=sys.stderr)
+    print("category=fail_startup reason=listen_timeout", file=sys.stderr, flush=True)
     os._exit(1)
 
 
@@ -375,6 +375,8 @@ def _parse_server_ws_max_size(raw_ws_max_size: str) -> int:
 
 
 def _run_codex_sessions_retag(args: argparse.Namespace) -> None:
+    from app.codex_sessions_retag import default_codex_home, retag_codex_sessions
+
     codex_home = args.codex_home or default_codex_home()
     if not args.dry_run:
         _confirm_retag_write(args.yes)

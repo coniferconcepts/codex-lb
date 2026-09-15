@@ -231,6 +231,9 @@ async def async_client(app_instance):
             await service.drain_persistence_tasks(timeout_seconds=5)
 
     async with app_instance.router.lifespan_context(app_instance):
+        from app.core.startup import wait_for_startup_complete
+
+        await wait_for_startup_complete(timeout_seconds=30)
         transport = ASGITransport(app=app_instance)
         async with AsyncClient(
             transport=transport,

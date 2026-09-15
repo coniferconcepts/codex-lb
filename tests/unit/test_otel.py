@@ -284,6 +284,9 @@ def test_create_app_instruments_unbuilt_stack_before_testclient_lifespan(
 
     @asynccontextmanager
     async def probe_lifespan(_app):
+        import app.core.startup as startup_module
+
+        startup_module.mark_startup_complete()
         lifecycle.append("started")
         yield
         lifecycle.append("stopped")
@@ -746,7 +749,7 @@ async def test_lifespan_drains_actual_audit_and_cancelled_fleet_tasks_before_res
 
     async def _run_lifespan() -> None:
         async with main.lifespan(main.app):
-            await asyncio.sleep(0)
+            assert await startup_module.wait_for_startup_complete(timeout_seconds=5)
             lifespan_entered.set()
             await begin_shutdown.wait()
 
@@ -908,7 +911,7 @@ async def test_lifespan_marks_bridge_membership_stale_on_shutdown(monkeypatch: p
     )
 
     async with main.lifespan(main.app):
-        await asyncio.sleep(0)
+        assert await startup_module.wait_for_startup_complete(timeout_seconds=5)
         assert startup_module._startup_complete is True
 
     register.assert_awaited_once_with("pod-a", endpoint_base_url=None)
@@ -999,7 +1002,7 @@ async def test_lifespan_shutdown_fails_bridge_capacity_waiter_and_cancels_usage_
 
     try:
         async with main.lifespan(app):
-            await asyncio.sleep(0)
+            assert await startup_module.wait_for_startup_complete(timeout_seconds=5)
             assert startup_module._startup_complete is True
 
             service = get_proxy_service_for_app(app)
@@ -1172,7 +1175,9 @@ async def test_lifespan_marks_bridge_membership_stale_for_hostname_shared_ids(
     )
 
     async with main.lifespan(main.app):
-        await asyncio.sleep(0)
+        from app.core.startup import wait_for_startup_complete
+
+        assert await wait_for_startup_complete(timeout_seconds=5)
 
     ring_service.mark_stale.assert_awaited_once_with(
         "pod-a",
@@ -1247,8 +1252,8 @@ async def test_lifespan_registers_bridge_without_waiting_for_advertise_self_prob
     )
 
     async with main.lifespan(main.app):
+        assert await startup_module.wait_for_startup_complete(timeout_seconds=5)
         assert startup_module._startup_complete is True
-        await asyncio.sleep(0)
         wait_for_reachable.assert_awaited_once_with(
             "http://pod-a.bridge.default.svc.cluster.local:2455",
             connect_timeout_seconds=settings.upstream_connect_timeout_seconds,
@@ -1371,7 +1376,7 @@ async def test_lifespan_allows_missing_bridge_schema_when_fail_fast_disabled(mon
     )
 
     async with main.lifespan(main.app):
-        await asyncio.sleep(0)
+        assert await startup_module.wait_for_startup_complete(timeout_seconds=5)
         assert startup_module._bridge_durable_schema_ready is False
 
 

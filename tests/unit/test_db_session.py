@@ -690,6 +690,7 @@ async def test_init_db_defers_sqlite_check_during_pre_listen(monkeypatch, tmp_pa
 
     from app.core.startup_budget import mark_listen_watch_started, reset_startup_budget_for_tests
 
+    reset_startup_budget_for_tests()
     mark_listen_watch_started()
     try:
         await session_module.init_db()

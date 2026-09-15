@@ -489,7 +489,9 @@ def test_codex_sessions_retag_reports_file_access_errors(monkeypatch, tmp_path):
     def fail_retag(**_kwargs):
         raise PermissionError("cannot read session.jsonl")
 
-    monkeypatch.setattr(cli, "retag_codex_sessions", fail_retag)
+    import app.codex_sessions_retag as retag_mod
+
+    monkeypatch.setattr(retag_mod, "retag_codex_sessions", fail_retag)
 
     with pytest.raises(SystemExit, match="Unable to read or write Codex session files: cannot read session.jsonl"):
         cli.main(
@@ -752,6 +754,32 @@ def test_subprocess_exits_when_listen_never_happens(tmp_path: Any) -> None:
     )
     assert result.returncode == 1
     assert "listen_timeout" in result.stderr
+
+
+def test_importing_cli_does_not_import_app_main() -> None:
+    """Listen watch cannot start until app.cli finishes importing.
+
+    uvicorn load_app() is the heavy import; importing the CLI module must not
+    pull app.main (FastAPI/SQLite) at module load.
+    """
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from app import cli; "
+            "assert 'app.main' not in sys.modules, sorted(sys.modules); "
+            "assert 'app.codex_sessions_retag' not in sys.modules",
+        ],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_utc_default_formatter_formats_without_converter_binding_error():

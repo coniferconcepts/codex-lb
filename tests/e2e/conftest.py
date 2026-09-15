@@ -75,6 +75,9 @@ async def e2e_client(db_setup, monkeypatch):
     monkeypatch.setattr(main_module, "init_db", _noop_init_db)
     app = create_app()
     async with app.router.lifespan_context(app):
+        from app.core.startup import wait_for_startup_complete
+
+        await wait_for_startup_complete(timeout_seconds=30)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
             yield client

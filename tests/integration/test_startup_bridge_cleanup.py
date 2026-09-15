@@ -61,6 +61,9 @@ async def test_lifespan_startup_purges_abandoned_ownerless_bridge_rows(db_setup,
 
     app = create_app()
     async with app.router.lifespan_context(app):
+        from app.core.startup import wait_for_startup_complete
+
+        assert await wait_for_startup_complete(timeout_seconds=30)
         async with SessionLocal() as session:
             remaining_keys = set(
                 await session.scalars(

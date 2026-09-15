@@ -8,7 +8,7 @@ import stat
 import sys
 import time
 from collections.abc import Awaitable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from functools import lru_cache
 from importlib import import_module
@@ -51,6 +51,7 @@ from app.core.middleware import (
 )
 from app.core.middleware.dashboard_gzip import add_dashboard_gzip_middleware
 from app.core.middleware.inflight import InFlightMiddleware
+from app.core.middleware.startup_gate import StartupGateMiddleware
 from app.core.openai.model_refresh_scheduler import build_model_refresh_scheduler
 from app.core.resilience.backpressure import BackpressureMiddleware
 from app.core.resilience.bulkhead import BulkheadMiddleware, get_bulkhead
@@ -344,11 +345,27 @@ async def lifespan(app: FastAPI):
     ring_service = None
     heartbeat_task: asyncio.Task[None] | None = None
     instance_id = None
+    loop_lag_task = None
+    usage_scheduler = None
+    api_key_limit_reset_scheduler = None
+    api_key_last_used_flush_scheduler = None
+    model_scheduler = None
+    sticky_session_cleanup_scheduler = None
+    quota_planner_scheduler = None
+    auth_guardian_scheduler = None
+    automations_scheduler = None
+    rate_limit_reset_credits_scheduler = None
+    account_usage_rollup_scheduler = None
+    account_deletion_scheduler = None
+    data_retention_scheduler = None
+    telemetry_scheduler = None
+    live_usage_ingestor = None
+    cache_poller = None
 
     start_startup_budget_watch()
     set_startup_phase(REASON_DB_MIGRATE)
     shutdown_state.prepare_lifespan_start()
-    startup_module._startup_complete = False
+    startup_module.reset_startup_complete()
     startup_module.reset_bridge_registration()
     await get_settings_cache().invalidate(propagate=False)
     await get_rate_limit_headers_cache().invalidate()
@@ -376,32 +393,7 @@ async def lifespan(app: FastAPI):
     bridge_durable_schema_ready = await _ensure_bridge_durable_schema_ready(settings)
     if bridge_durable_schema_ready is True:
         startup_module.mark_bridge_durable_schema_ready()
-        dashboard_settings = await get_settings_cache().get()
-        ownerless_cutoff = utcnow() - timedelta(
-            seconds=_abandoned_bridge_retention_seconds(dashboard_settings, settings)
-        )
-        deleted_bridge_rows = await DurableBridgeSessionCoordinator(SessionLocal).purge_owned_sessions_on_startup(
-            instance_id=settings.http_responses_session_bridge_instance_id,
-            owner_process_epoch=http_bridge_owner_process_epoch(),
-            ownerless_cutoff=ownerless_cutoff,
-        )
-        if deleted_bridge_rows > 0:
-            logger.info(
-                "Purged durable HTTP bridge rows from previous process instance",
-                extra={
-                    "instance_id": settings.http_responses_session_bridge_instance_id,
-                    "deleted": deleted_bridge_rows,
-                },
-            )
-        purged_operation_rows = await DurableBridgeSessionCoordinator(SessionLocal).purge_operation_spool(
-            cutoff=utcnow()
-            - timedelta(seconds=settings.http_responses_session_bridge_operation_spool_retention_seconds),
-        )
-        if purged_operation_rows > 0:
-            logger.info(
-                "Purged expired durable HTTP bridge operation transcript rows",
-                extra={"deleted": purged_operation_rows},
-            )
+
     from app.core.auth.api_key_cache import get_api_key_cache
     from app.core.cache.invalidation import (
         NAMESPACE_ACCOUNT_ROUTING,
@@ -421,249 +413,294 @@ async def lifespan(app: FastAPI):
     from app.modules.proxy.account_cache import get_account_selection_cache, get_routing_availability_cache
     from app.modules.rate_limit_reset_credits.store import get_rate_limit_reset_credits_store
 
-    # The poller MUST be installed before the model scheduler starts: a first
-    # leader tick that persists a changed snapshot bumps the model_registry
-    # namespace through the global poller, and a not-yet-installed poller would
-    # silently drop that bump (followers would then wait for the refresh-tick
-    # backstop instead of the cache poll bound).
-    cache_poller = CacheInvalidationPoller(SessionLocal)
-    cache_poller.on_invalidation(NAMESPACE_API_KEY, get_api_key_cache().clear)
-    cache_poller.on_invalidation(NAMESPACE_FIREWALL, get_firewall_ip_cache().invalidate_all)
-    routing_availability_cache = get_routing_availability_cache()
-    # Remote-bump callbacks must be non-propagating variants: a propagating callback
-    # would re-bump on every observed bump and feedback-loop across replicas.
-    cache_poller.on_invalidation(NAMESPACE_ACCOUNT_ROUTING, routing_availability_cache.refresh_from_db)
-    cache_poller.on_invalidation(
-        NAMESPACE_ACCOUNT_SELECTION,
-        lambda: get_account_selection_cache().invalidate(propagate=False),
-    )
-    cache_poller.on_invalidation(
-        NAMESPACE_SETTINGS,
-        lambda: get_settings_cache().invalidate(propagate=False),
-    )
-    cache_poller.on_invalidation(NAMESPACE_UPSTREAM_ROUTE, get_upstream_route_cache().clear)
-    # The route resolver also reads the dashboard settings row (routing enabled
-    # + default pool id), so settings bumps clear resolved routes as well.
-    cache_poller.on_invalidation(NAMESPACE_SETTINGS, get_upstream_route_cache().clear)
-    # The bus carries no payload, so a peer redeem clears this replica's whole
-    # reset-credits store; the refresh scheduler repopulates it on its next tick.
-    cache_poller.on_invalidation(NAMESPACE_RESET_CREDITS, get_rate_limit_reset_credits_store().invalidate)
-    if settings.model_registry_enabled:
-        from app.core.openai.model_registry_store import reconcile_model_registry_from_store
-
-        # raise_on_error=True so a transient load failure leaves the
-        # model_registry version unacknowledged and is retried on the next poll
-        # cycle (matching the account_routing refresh callback) instead of being
-        # swallowed, which would strand this replica on the stale catalog until
-        # the non-leader scheduler backstop.
-        cache_poller.on_invalidation(
-            NAMESPACE_MODEL_REGISTRY,
-            lambda: reconcile_model_registry_from_store(raise_on_error=True),
-        )
-    set_cache_invalidation_poller(cache_poller)
-
-    # Seed the invalidation version baseline BEFORE loading the routing snapshot
-    # and BEFORE the one-shot model-registry reconcile below. prime() records the
-    # current version of every namespace (and flushes any pending bumps) without
-    # firing callbacks, so a peer bump committed after this point is observed as a
-    # change on the first background poll instead of being silently acknowledged
-    # as pre-existing state. In particular a leader that persists-and-bumps the
-    # model_registry namespace in the window between the reconcile's snapshot read
-    # and the poller's first background tick would otherwise be absorbed as the
-    # initial baseline, leaving this replica on the pre-refresh catalog until the
-    # non-leader scheduler backstop (default 300s) instead of the sub-second cache
-    # poll bound.
-    try:
-        await cache_poller.prime()
-    except Exception:
-        # prime() raises when the baseline version read fails, leaving the poller
-        # uninitialized so an explicit retry would remain baseline-only. Startup
-        # continues, but start() arms conservative recovery: the first successful
-        # background read invokes callbacks for positive versions before
-        # acknowledging them, so a peer bump cannot become a callback-less
-        # baseline after local caches are warm.
-        logger.warning("cache invalidation baseline prime failed", exc_info=True)
-    try:
-        await routing_availability_cache.refresh_from_db()
-    except Exception:
-        # Unseeded snapshot degrades to local-mark semantics; the next
-        # account_routing bump retries the refresh via the poller callback.
-        logger.warning("initial routing availability snapshot refresh failed", exc_info=True)
-
-    if settings.model_registry_enabled:
-        from app.core.openai.model_registry_store import reconcile_model_registry_from_store
-
-        # Warm the in-memory registry from the persisted snapshot before any
-        # scheduler starts so a restarted replica serves the refreshed catalog
-        # instead of the bootstrap floor. Never fails startup.
-        await reconcile_model_registry_from_store()
-
-    await cache_poller.start()
-
-    async with SessionLocal() as session:
-        seeded_count = await AccountsRepository(session).seed_hard_sticky_outage_grace_on_startup()
-    if seeded_count > 0:
-        logger.info(
-            "Seeded hard codex_session purge grace for already-unavailable accounts seeded_count=%s",
-            seeded_count,
-        )
-
-    usage_scheduler = build_usage_refresh_scheduler()
-    api_key_limit_reset_scheduler = build_api_key_limit_reset_scheduler()
-    api_key_last_used_flush_scheduler = build_api_key_last_used_flush_scheduler()
-    model_scheduler = build_model_refresh_scheduler()
-    sticky_session_cleanup_scheduler = build_sticky_session_cleanup_scheduler()
-    quota_planner_scheduler = build_quota_planner_scheduler()
-    auth_guardian_scheduler = build_auth_guardian_scheduler()
-    automations_scheduler = build_automations_scheduler()
-    rate_limit_reset_credits_scheduler = build_rate_limit_reset_credits_scheduler()
-    account_usage_rollup_scheduler = build_account_usage_rollup_scheduler()
-    account_deletion_scheduler = build_account_deletion_scheduler()
-    data_retention_scheduler = build_data_retention_scheduler()
-    telemetry_scheduler = build_telemetry_scheduler()
-    # Hold the instance: this lifespan owns it (and keeps it strongly rooted)
-    # even if a nested lifespan on another loop replaces the module-global
-    # singleton in the meantime; shutdown below stops exactly this instance.
-    live_usage_ingestor = start_live_usage_ingestor()
-    await usage_scheduler.start()
-    await api_key_limit_reset_scheduler.start()
-    await api_key_last_used_flush_scheduler.start()
-    await model_scheduler.start()
-    await sticky_session_cleanup_scheduler.start()
-    await quota_planner_scheduler.start()
-    await auth_guardian_scheduler.start()
-    await automations_scheduler.start()
-    await rate_limit_reset_credits_scheduler.start()
-    await account_usage_rollup_scheduler.start()
-    await account_deletion_scheduler.start()
-    await data_retention_scheduler.start()
-    await telemetry_scheduler.start()
-    if settings.metrics_enabled and PROMETHEUS_AVAILABLE:
-        import uvicorn
-
-        from app.core.server import SignalNeutralServer
-
-        scrape_registry = make_scrape_registry()
-        prometheus_module = import_module("prometheus_client")
-        make_asgi_app = getattr(prometheus_module, "make_asgi_app")
-        metrics_app = make_asgi_app(registry=scrape_registry)
-        config = uvicorn.Config(
-            metrics_app,
-            host=settings.metrics_host,
-            port=settings.metrics_port,
-            log_level="warning",
-        )
-        metrics_server = SignalNeutralServer(config)
-
-        async def _serve_metrics(srv: _MetricsServer) -> None:
-            try:
-                await srv.serve()
-            except SystemExit as exc:
-                if _is_benign_metrics_bind_failure(exc):
-                    logger.info(
-                        "Metrics port %d unavailable (another worker likely serves metrics)",
-                        settings.metrics_port,
-                    )
-                elif _is_metrics_bind_conflict(exc):
-                    _log_non_multiproc_metrics_bind_conflict(settings.metrics_port)
-                else:
-                    raise
-            except OSError as exc:
-                if _is_benign_metrics_bind_failure(exc):
-                    logger.info(
-                        "Metrics port %d already bound (another worker serves metrics)",
-                        settings.metrics_port,
-                    )
-                elif _is_metrics_bind_conflict(exc):
-                    _log_non_multiproc_metrics_bind_conflict(settings.metrics_port)
-                else:
-                    raise
-
-        metrics_server_task = asyncio.create_task(_serve_metrics(metrics_server))
-    elif settings.metrics_enabled:
-        logger.warning("Metrics endpoint enabled but prometheus-client is not installed")
-
-    async def _complete_bridge_registration(svc: RingMembershipService, iid: str) -> None:
-        if bridge_endpoint_base_url is None:
-            await _activate_bridge_membership(svc, iid)
-            startup_module.mark_bridge_registration_complete()
-            return
-        await _validate_bridge_advertise_endpoint_for_multi_replica(
-            svc=svc,
-            settings=settings,
-            instance_id=iid,
-            endpoint_base_url=bridge_endpoint_base_url,
-        )
-        await svc.register(iid, endpoint_base_url=None)
-        await _wait_for_bridge_advertise_endpoint(
-            bridge_endpoint_base_url,
-            connect_timeout_seconds=settings.upstream_connect_timeout_seconds,
-        )
-        await svc.heartbeat(iid, endpoint_base_url=bridge_endpoint_base_url)
-        startup_module.mark_bridge_registration_complete()
-
-    async def _heartbeat_only(svc: RingMembershipService, iid: str) -> None:
-        while True:
-            await asyncio.sleep(RING_HEARTBEAT_INTERVAL_SECONDS)
-            try:
-                await svc.heartbeat(iid, endpoint_base_url=bridge_endpoint_base_url)
-            except Exception:
-                logger.warning("Ring heartbeat failed", exc_info=True)
-            await run_http_bridge_heartbeat_maintenance(getattr(app.state, "proxy_service", None))
-            await refresh_cap_partition(svc.list_active, iid)
-
-    async def _register_and_heartbeat(svc: RingMembershipService, iid: str) -> None:
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                await _complete_bridge_registration(svc, iid)
-                logger.info("Registered in bridge ring", extra={"instance_id": iid, "attempt": attempt})
-                break
-            except Exception:
-                delay = min(5.0 * (2 ** min(attempt - 1, 5)), 60.0)
-                logger.warning("Ring registration attempt %d failed, retrying in %.0fs", attempt, delay, exc_info=True)
-                await asyncio.sleep(delay)
-        await refresh_cap_partition(svc.list_active, iid)
-        await _heartbeat_only(svc, iid)
-
-    async def _activate_bridge_membership(svc: RingMembershipService, iid: str) -> None:
-        if bridge_endpoint_base_url is None:
-            await svc.register(iid, endpoint_base_url=None)
-            return
-        await svc.register(iid, endpoint_base_url=bridge_endpoint_base_url)
-
-    ring_service: RingMembershipService | None = None
-    instance_id: str | None = None
-    heartbeat_task: asyncio.Task[None] | None = None
-    ring_service = RingMembershipService(SessionLocal)
-    instance_id = settings.http_responses_session_bridge_instance_id
-    heartbeat_task = asyncio.create_task(_register_and_heartbeat(ring_service, instance_id))
-    loop_lag_task: asyncio.Task[None] | None = None
-    if settings.event_loop_lag_warn_threshold_seconds > 0:
-        loop_lag_task = asyncio.create_task(
-            run_event_loop_lag_monitor(
-                warn_threshold_seconds=settings.event_loop_lag_warn_threshold_seconds,
+    async def _complete_startup() -> None:
+        nonlocal metrics_server, metrics_server_task, ring_service, heartbeat_task
+        nonlocal instance_id, loop_lag_task, usage_scheduler, api_key_limit_reset_scheduler
+        nonlocal api_key_last_used_flush_scheduler, model_scheduler, sticky_session_cleanup_scheduler
+        nonlocal quota_planner_scheduler, auth_guardian_scheduler, automations_scheduler
+        nonlocal rate_limit_reset_credits_scheduler, account_usage_rollup_scheduler
+        nonlocal account_deletion_scheduler, data_retention_scheduler, telemetry_scheduler
+        nonlocal live_usage_ingestor, cache_poller
+        if bridge_durable_schema_ready is True:
+            dashboard_settings = await get_settings_cache().get()
+            ownerless_cutoff = utcnow() - timedelta(
+                seconds=_abandoned_bridge_retention_seconds(dashboard_settings, settings)
             )
+            deleted_bridge_rows = await DurableBridgeSessionCoordinator(SessionLocal).purge_owned_sessions_on_startup(
+                instance_id=settings.http_responses_session_bridge_instance_id,
+                owner_process_epoch=http_bridge_owner_process_epoch(),
+                ownerless_cutoff=ownerless_cutoff,
+            )
+            if deleted_bridge_rows > 0:
+                logger.info(
+                    "Purged durable HTTP bridge rows from previous process instance",
+                    extra={
+                        "instance_id": settings.http_responses_session_bridge_instance_id,
+                        "deleted": deleted_bridge_rows,
+                    },
+                )
+            purged_operation_rows = await DurableBridgeSessionCoordinator(SessionLocal).purge_operation_spool(
+                cutoff=utcnow()
+                - timedelta(seconds=settings.http_responses_session_bridge_operation_spool_retention_seconds),
+            )
+            if purged_operation_rows > 0:
+                logger.info(
+                    "Purged expired durable HTTP bridge operation transcript rows",
+                    extra={"deleted": purged_operation_rows},
+                )
+        # The poller MUST be installed before the model scheduler starts: a first
+        # leader tick that persists a changed snapshot bumps the model_registry
+        # namespace through the global poller, and a not-yet-installed poller would
+        # silently drop that bump (followers would then wait for the refresh-tick
+        # backstop instead of the cache poll bound).
+        cache_poller = CacheInvalidationPoller(SessionLocal)
+        cache_poller.on_invalidation(NAMESPACE_API_KEY, get_api_key_cache().clear)
+        cache_poller.on_invalidation(NAMESPACE_FIREWALL, get_firewall_ip_cache().invalidate_all)
+        routing_availability_cache = get_routing_availability_cache()
+        # Remote-bump callbacks must be non-propagating variants: a propagating callback
+        # would re-bump on every observed bump and feedback-loop across replicas.
+        cache_poller.on_invalidation(NAMESPACE_ACCOUNT_ROUTING, routing_availability_cache.refresh_from_db)
+        cache_poller.on_invalidation(
+            NAMESPACE_ACCOUNT_SELECTION,
+            lambda: get_account_selection_cache().invalidate(propagate=False),
         )
-    startup_module._startup_complete = True
-    mark_pre_listen_complete()
+        cache_poller.on_invalidation(
+            NAMESPACE_SETTINGS,
+            lambda: get_settings_cache().invalidate(propagate=False),
+        )
+        cache_poller.on_invalidation(NAMESPACE_UPSTREAM_ROUTE, get_upstream_route_cache().clear)
+        # The route resolver also reads the dashboard settings row (routing enabled
+        # + default pool id), so settings bumps clear resolved routes as well.
+        cache_poller.on_invalidation(NAMESPACE_SETTINGS, get_upstream_route_cache().clear)
+        # The bus carries no payload, so a peer redeem clears this replica's whole
+        # reset-credits store; the refresh scheduler repopulates it on its next tick.
+        cache_poller.on_invalidation(NAMESPACE_RESET_CREDITS, get_rate_limit_reset_credits_store().invalidate)
+        if settings.model_registry_enabled:
+            from app.core.openai.model_registry_store import reconcile_model_registry_from_store
 
-    async def _run_post_listen_sqlite_checks() -> None:
+            # raise_on_error=True so a transient load failure leaves the
+            # model_registry version unacknowledged and is retried on the next poll
+            # cycle (matching the account_routing refresh callback) instead of being
+            # swallowed, which would strand this replica on the stale catalog until
+            # the non-leader scheduler backstop.
+            cache_poller.on_invalidation(
+                NAMESPACE_MODEL_REGISTRY,
+                lambda: reconcile_model_registry_from_store(raise_on_error=True),
+            )
+        set_cache_invalidation_poller(cache_poller)
+
+        # Seed the invalidation version baseline BEFORE loading the routing snapshot
+        # and BEFORE the one-shot model-registry reconcile below. prime() records the
+        # current version of every namespace (and flushes any pending bumps) without
+        # firing callbacks, so a peer bump committed after this point is observed as a
+        # change on the first background poll instead of being silently acknowledged
+        # as pre-existing state. In particular a leader that persists-and-bumps the
+        # model_registry namespace in the window between the reconcile's snapshot read
+        # and the poller's first background tick would otherwise be absorbed as the
+        # initial baseline, leaving this replica on the pre-refresh catalog until the
+        # non-leader scheduler backstop (default 300s) instead of the sub-second cache
+        # poll bound.
         try:
-            await run_sqlite_startup_integrity_check()
+            await cache_poller.prime()
         except Exception:
-            logger.exception("Post-listen SQLite startup integrity check failed")
+            # prime() raises when the baseline version read fails, leaving the poller
+            # uninitialized so an explicit retry would remain baseline-only. Startup
+            # continues, but start() arms conservative recovery: the first successful
+            # background read invokes callbacks for positive versions before
+            # acknowledging them, so a peer bump cannot become a callback-less
+            # baseline after local caches are warm.
+            logger.warning("cache invalidation baseline prime failed", exc_info=True)
         try:
-            await run_sqlite_startup_schema_drift_check()
+            await routing_availability_cache.refresh_from_db()
         except Exception:
-            logger.exception("Post-listen schema drift check failed")
+            # Unseeded snapshot degrades to local-mark semantics; the next
+            # account_routing bump retries the refresh via the poller callback.
+            logger.warning("initial routing availability snapshot refresh failed", exc_info=True)
 
-    asyncio.create_task(_run_post_listen_sqlite_checks())
+        if settings.model_registry_enabled:
+            from app.core.openai.model_registry_store import reconcile_model_registry_from_store
 
+            # Warm the in-memory registry from the persisted snapshot before any
+            # scheduler starts so a restarted replica serves the refreshed catalog
+            # instead of the bootstrap floor. Never fails startup.
+            await reconcile_model_registry_from_store()
+
+        await cache_poller.start()
+
+        try:
+            async with SessionLocal() as session:
+                seeded_count = await AccountsRepository(session).seed_hard_sticky_outage_grace_on_startup()
+            if seeded_count > 0:
+                logger.info(
+                    "Seeded hard codex_session purge grace for already-unavailable accounts seeded_count=%s",
+                    seeded_count,
+                )
+        except Exception:
+            logger.warning("hard-sticky outage grace seed failed", exc_info=True)
+
+        usage_scheduler = build_usage_refresh_scheduler()
+        api_key_limit_reset_scheduler = build_api_key_limit_reset_scheduler()
+        api_key_last_used_flush_scheduler = build_api_key_last_used_flush_scheduler()
+        model_scheduler = build_model_refresh_scheduler()
+        sticky_session_cleanup_scheduler = build_sticky_session_cleanup_scheduler()
+        quota_planner_scheduler = build_quota_planner_scheduler()
+        auth_guardian_scheduler = build_auth_guardian_scheduler()
+        automations_scheduler = build_automations_scheduler()
+        rate_limit_reset_credits_scheduler = build_rate_limit_reset_credits_scheduler()
+        account_usage_rollup_scheduler = build_account_usage_rollup_scheduler()
+        account_deletion_scheduler = build_account_deletion_scheduler()
+        data_retention_scheduler = build_data_retention_scheduler()
+        telemetry_scheduler = build_telemetry_scheduler()
+        # Hold the instance: this lifespan owns it (and keeps it strongly rooted)
+        # even if a nested lifespan on another loop replaces the module-global
+        # singleton in the meantime; shutdown below stops exactly this instance.
+        live_usage_ingestor = start_live_usage_ingestor()
+        await usage_scheduler.start()
+        await api_key_limit_reset_scheduler.start()
+        await api_key_last_used_flush_scheduler.start()
+        await model_scheduler.start()
+        await sticky_session_cleanup_scheduler.start()
+        await quota_planner_scheduler.start()
+        await auth_guardian_scheduler.start()
+        await automations_scheduler.start()
+        await rate_limit_reset_credits_scheduler.start()
+        await account_usage_rollup_scheduler.start()
+        await account_deletion_scheduler.start()
+        await data_retention_scheduler.start()
+        await telemetry_scheduler.start()
+        if settings.metrics_enabled and PROMETHEUS_AVAILABLE:
+            import uvicorn
+
+            from app.core.server import SignalNeutralServer
+
+            scrape_registry = make_scrape_registry()
+            prometheus_module = import_module("prometheus_client")
+            make_asgi_app = getattr(prometheus_module, "make_asgi_app")
+            metrics_app = make_asgi_app(registry=scrape_registry)
+            config = uvicorn.Config(
+                metrics_app,
+                host=settings.metrics_host,
+                port=settings.metrics_port,
+                log_level="warning",
+            )
+            metrics_server = SignalNeutralServer(config)
+
+            async def _serve_metrics(srv: _MetricsServer) -> None:
+                try:
+                    await srv.serve()
+                except SystemExit as exc:
+                    if _is_benign_metrics_bind_failure(exc):
+                        logger.info(
+                            "Metrics port %d unavailable (another worker likely serves metrics)",
+                            settings.metrics_port,
+                        )
+                    elif _is_metrics_bind_conflict(exc):
+                        _log_non_multiproc_metrics_bind_conflict(settings.metrics_port)
+                    else:
+                        raise
+                except OSError as exc:
+                    if _is_benign_metrics_bind_failure(exc):
+                        logger.info(
+                            "Metrics port %d already bound (another worker serves metrics)",
+                            settings.metrics_port,
+                        )
+                    elif _is_metrics_bind_conflict(exc):
+                        _log_non_multiproc_metrics_bind_conflict(settings.metrics_port)
+                    else:
+                        raise
+
+            metrics_server_task = asyncio.create_task(_serve_metrics(metrics_server))
+        elif settings.metrics_enabled:
+            logger.warning("Metrics endpoint enabled but prometheus-client is not installed")
+
+        async def _complete_bridge_registration(svc: RingMembershipService, iid: str) -> None:
+            if bridge_endpoint_base_url is None:
+                await _activate_bridge_membership(svc, iid)
+                startup_module.mark_bridge_registration_complete()
+                return
+            await _validate_bridge_advertise_endpoint_for_multi_replica(
+                svc=svc,
+                settings=settings,
+                instance_id=iid,
+                endpoint_base_url=bridge_endpoint_base_url,
+            )
+            await svc.register(iid, endpoint_base_url=None)
+            await _wait_for_bridge_advertise_endpoint(
+                bridge_endpoint_base_url,
+                connect_timeout_seconds=settings.upstream_connect_timeout_seconds,
+            )
+            await svc.heartbeat(iid, endpoint_base_url=bridge_endpoint_base_url)
+            startup_module.mark_bridge_registration_complete()
+
+        async def _heartbeat_only(svc: RingMembershipService, iid: str) -> None:
+            while True:
+                await asyncio.sleep(RING_HEARTBEAT_INTERVAL_SECONDS)
+                try:
+                    await svc.heartbeat(iid, endpoint_base_url=bridge_endpoint_base_url)
+                except Exception:
+                    logger.warning("Ring heartbeat failed", exc_info=True)
+                await run_http_bridge_heartbeat_maintenance(getattr(app.state, "proxy_service", None))
+                await refresh_cap_partition(svc.list_active, iid)
+
+        async def _register_and_heartbeat(svc: RingMembershipService, iid: str) -> None:
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    await _complete_bridge_registration(svc, iid)
+                    logger.info("Registered in bridge ring", extra={"instance_id": iid, "attempt": attempt})
+                    break
+                except Exception:
+                    delay = min(5.0 * (2 ** min(attempt - 1, 5)), 60.0)
+                    logger.warning(
+                        "Ring registration attempt %d failed, retrying in %.0fs",
+                        attempt,
+                        delay,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(delay)
+            await refresh_cap_partition(svc.list_active, iid)
+            await _heartbeat_only(svc, iid)
+
+        async def _activate_bridge_membership(svc: RingMembershipService, iid: str) -> None:
+            if bridge_endpoint_base_url is None:
+                await svc.register(iid, endpoint_base_url=None)
+                return
+            await svc.register(iid, endpoint_base_url=bridge_endpoint_base_url)
+
+        ring_service = RingMembershipService(SessionLocal)
+        instance_id = settings.http_responses_session_bridge_instance_id
+        heartbeat_task = asyncio.create_task(_register_and_heartbeat(ring_service, instance_id))
+        if settings.event_loop_lag_warn_threshold_seconds > 0:
+            loop_lag_task = asyncio.create_task(
+                run_event_loop_lag_monitor(
+                    warn_threshold_seconds=settings.event_loop_lag_warn_threshold_seconds,
+                )
+            )
+        startup_module.mark_startup_complete()
+        mark_pre_listen_complete()
+
+        async def _run_post_listen_sqlite_checks() -> None:
+            try:
+                await run_sqlite_startup_integrity_check()
+            except Exception:
+                logger.exception("Post-listen SQLite startup integrity check failed")
+            try:
+                await run_sqlite_startup_schema_drift_check()
+            except Exception:
+                logger.exception("Post-listen schema drift check failed")
+
+        asyncio.create_task(_run_post_listen_sqlite_checks())
+
+
+    warmup_task = asyncio.create_task(_complete_startup())
     try:
         yield
     finally:
+        if not warmup_task.done():
+            warmup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await warmup_task
         mark_pre_listen_complete()
         shutdown_state.commit_shutdown(timeout_seconds=settings.shutdown_drain_timeout_seconds)
         remaining_drain_seconds = shutdown_state.remaining_drain_timeout_seconds() or 0.0
@@ -764,31 +801,46 @@ async def lifespan(app: FastAPI):
         # and is stopped by release(), which then owns renewal for its bounded
         # drain. It is a no-op when leader election is disabled.
         get_leader_election().start_release_keeper()
-        await quota_planner_scheduler.stop()
-        await auth_guardian_scheduler.stop()
-        await automations_scheduler.stop()
-        await sticky_session_cleanup_scheduler.stop()
-        await model_scheduler.stop()
+        if quota_planner_scheduler is not None:
+            await quota_planner_scheduler.stop()
+        if auth_guardian_scheduler is not None:
+            await auth_guardian_scheduler.stop()
+        if automations_scheduler is not None:
+            await automations_scheduler.stop()
+        if sticky_session_cleanup_scheduler is not None:
+            await sticky_session_cleanup_scheduler.stop()
+        if model_scheduler is not None:
+            await model_scheduler.stop()
         # Stop the invalidation poller only after the model scheduler: a final
         # leader tick may still bump through the installed poller.
-        await cache_poller.stop()
-        if get_cache_invalidation_poller() is cache_poller:
-            # A stopped poller must not keep receiving propagation requests.
-            set_cache_invalidation_poller(None)
-        await api_key_limit_reset_scheduler.stop()
+        if cache_poller is not None:
+            await cache_poller.stop()
+            if get_cache_invalidation_poller() is cache_poller:
+                # A stopped poller must not keep receiving propagation requests.
+                set_cache_invalidation_poller(None)
+        if api_key_limit_reset_scheduler is not None:
+            await api_key_limit_reset_scheduler.stop()
         # Final last_used_at flush (bounded retries). Settlement tasks were
         # drained above; if that drain timed out, a surviving task's later
         # record() write-throughs immediately (stop() switches the coalescer
         # to shutdown write-through mode before the final flush), so a late
         # touch is never parked in a pending map with no remaining flusher.
-        await api_key_last_used_flush_scheduler.stop()
-        await usage_scheduler.stop()
-        await stop_live_usage_ingestor(live_usage_ingestor)
-        await rate_limit_reset_credits_scheduler.stop()
-        await account_usage_rollup_scheduler.stop()
-        await account_deletion_scheduler.stop()
-        await data_retention_scheduler.stop()
-        await telemetry_scheduler.stop()
+        if api_key_last_used_flush_scheduler is not None:
+            await api_key_last_used_flush_scheduler.stop()
+        if usage_scheduler is not None:
+            await usage_scheduler.stop()
+        if live_usage_ingestor is not None:
+            await stop_live_usage_ingestor(live_usage_ingestor)
+        if rate_limit_reset_credits_scheduler is not None:
+            await rate_limit_reset_credits_scheduler.stop()
+        if account_usage_rollup_scheduler is not None:
+            await account_usage_rollup_scheduler.stop()
+        if account_deletion_scheduler is not None:
+            await account_deletion_scheduler.stop()
+        if data_retention_scheduler is not None:
+            await data_retention_scheduler.stop()
+        if telemetry_scheduler is not None:
+            await telemetry_scheduler.stop()
         # Release the scheduler leader lease only after every leader-gated
         # scheduler has stopped so no local tick re-acquires it; followers can
         # then take over immediately instead of waiting out the lease TTL.
@@ -834,6 +886,7 @@ def create_app() -> FastAPI:
         init_tracing(service_name="codex-lb", endpoint=settings.otel_exporter_endpoint, app=app)
 
     app.add_middleware(cast(Any, InFlightMiddleware))
+    app.add_middleware(cast(Any, StartupGateMiddleware))
     add_dashboard_gzip_middleware(app)
     add_dashboard_auth_proxy_middleware(app)
     add_request_decompression_middleware(app)

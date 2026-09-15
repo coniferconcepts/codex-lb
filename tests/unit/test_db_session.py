@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import subprocess
@@ -1621,6 +1622,94 @@ def test_session_teardown_bound_applies_to_file_backed_sqlite_url_forms(url_text
         session_module._session_teardown_bound_seconds(cast(session_module.AsyncSession, fake))
         == session_module._SQLITE_TEARDOWN_TIMEOUT_SECONDS
     )
+
+
+def test_teardown_completion_grace_is_a_slice_of_busy_timeout() -> None:
+    assert session_module._SQLITE_TEARDOWN_COMPLETION_GRACE_SECONDS == pytest.approx(0.75)
+
+
+@pytest.mark.asyncio
+async def test_completion_grace_holds_its_deadline_under_repeated_cancellation() -> None:
+    """Teardown runs in finally blocks; an edge cancel must not cut the grace
+    short and reclaim a connection that was about to be released (#2105)."""
+    release = asyncio.Event()
+    finished: list[bool] = []
+    result: list[bool] = []
+
+    async def _teardown() -> None:
+        await release.wait()
+        finished.append(True)
+
+    abandoned = asyncio.ensure_future(_teardown())
+
+    async def _caller() -> None:
+        result.append(await session_module._teardown_completed_after_bound(abandoned))
+
+    caller = asyncio.ensure_future(_caller())
+    await asyncio.sleep(0)
+    for _ in range(3):
+        caller.cancel()
+        await asyncio.sleep(0.01)
+    assert not caller.done(), "an edge cancel must not cut the grace short"
+
+    release.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await caller
+    await abandoned
+
+    assert finished, "the teardown must be allowed to finish inside the grace"
+    assert result == [True], "a teardown completing inside the grace is exempt from the reclaim"
+
+
+@pytest.mark.asyncio
+async def test_reclaim_skips_a_connection_the_failed_teardown_already_closed(tmp_path, caplog) -> None:
+    """Interrupt on a closed aiosqlite handle raises ValueError: no active
+    connection (#2105). Skip that handle instead of a false-positive reclaim."""
+    caplog.set_level(logging.INFO, logger=session_module.__name__)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'closed-reclaim.db'}",
+        poolclass=NullPool,
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        session = factory()
+        await session.execute(sa_text("DELETE FROM accounts"))
+        held = session_module._session_sync_connections(session)
+        assert held, "the open write transaction must expose its sync connection"
+        await session.rollback()
+        assert held[0].closed
+
+        async def _failed_after_release() -> None:
+            raise RuntimeError("rollback raised after the connection was released")
+
+        abandoned = asyncio.ensure_future(_failed_after_release())
+        with contextlib.suppress(RuntimeError):
+            await abandoned
+        with caplog.at_level(logging.DEBUG, logger=session_module.__name__):
+            await session_module._reclaim_wedged_sqlite_session(
+                session, abandoned, held, phase="rollback", elapsed_seconds=6.0
+            )
+
+        warnings = [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING]
+        assert not any("Interrupting a wedged SQLite connection failed" in message for message in warnings)
+        assert not any("connection interruption and invalidation" in message for message in warnings)
+        released = [message for message in warnings if "failed after releasing its connection" in message]
+        assert len(released) == 1, "the failure that ended the teardown must still be reported"
+        assert "rollback raised after the connection was released" in released[0]
+        assert "phase=rollback" in released[0] and "elapsed_seconds=6.0" in released[0]
+        assert session.info.get(session_module._SQLITE_TEARDOWN_WEDGED_INFO_KEY) is True
+
+        for _ in range(100):
+            pending = tuple(session_module._wedged_teardown_cleanup_tasks)
+            if not pending:
+                break
+            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=2.0)
+            await asyncio.sleep(0)
+        assert not session_module._wedged_teardown_cleanup_tasks
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

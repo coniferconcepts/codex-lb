@@ -248,6 +248,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     stop = threading.Event()
     timeout_seconds = _listen_timeout_seconds()
+    # Import before the listen clock: cold app.main can take minutes and must
+    # not consume CODEX_LB_LISTEN_TIMEOUT_SECONDS needed for fail-closed init_db.
+    _import_asgi_app()
     mark_listen_watch_started()
     watcher = threading.Thread(
         target=watch_listen_or_timeout,
@@ -281,6 +284,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     finally:
         stop.set()
         release_startup_budget()
+
+
+def _import_asgi_app() -> None:
+    """Load app.main before the listen watcher so init_db still fits in 300s.
+
+    Importing the CLI module must stay cheap; this runs only on the serve path.
+    Uvicorn's string target then reuses sys.modules.
+    """
+    print("category=startup phase=import_app", file=sys.stderr, flush=True)
+    import app.main as _app_main  # noqa: F401
 
 
 def _load_uvicorn():

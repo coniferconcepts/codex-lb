@@ -16,6 +16,13 @@ from app.core.runtime_logging import UtcDefaultFormatter
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _skip_asgi_import_in_cli_unit_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Serve-path import of app.main is intentional and slow; unit tests that
+    # call cli.main() must not pull FastAPI/SQLite.
+    monkeypatch.setattr(cli, "_import_asgi_app", lambda: None)
+
+
 def test_main_passes_timestamped_log_config(monkeypatch):
     captured: dict[str, Any] = {}
 
@@ -715,24 +722,37 @@ def test_main_starts_listen_watch_and_stops_it(monkeypatch):
     assert captured["kwargs"]["port"] == 2455
 
 
-def test_subprocess_exits_when_listen_never_happens(tmp_path: Any) -> None:
-    hang = tmp_path / "hang_uvicorn.py"
-    hang.write_text(
-        "import time\n"
-        "import uvicorn\n"
-        "def run(*args, **kwargs):\n"
-        "    time.sleep(8)\n"
-        "uvicorn.run = run\n",
-        encoding="utf-8",
-    )
+def test_main_imports_asgi_app_before_listen_watch(monkeypatch):
+    order: list[str] = []
+
+    def fake_import() -> None:
+        order.append("import")
+
+    def fake_mark() -> None:
+        order.append("watch")
+
+    def fake_run(*_args, **_kwargs) -> None:
+        order.append("run")
+
+    monkeypatch.setattr(sys, "argv", ["codex-lb"])
+    monkeypatch.setattr(cli, "_import_asgi_app", fake_import)
+    monkeypatch.setattr(cli, "mark_listen_watch_started", fake_mark)
+    monkeypatch.setattr(cli, "_run_server", fake_run)
+    monkeypatch.setattr(cli, "port_is_listening", lambda host, port: False)
+    monkeypatch.setattr(cli, "live_is_healthy", lambda host, port: False)
+
+    cli.main()
+
+    assert order == ["import", "watch", "run"]
+
+
+def test_subprocess_exits_when_listen_never_happens() -> None:
     import os
     import subprocess
     from pathlib import Path
 
     env = os.environ.copy()
     env["CODEX_LB_LISTEN_TIMEOUT_SECONDS"] = "0.8"
-    env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env.get("PYTHONPATH", "")
-    # sitecustomize-style: import hang by starting python -c after inserting path
     root = Path(__file__).resolve().parents[2]
     sock = __import__("socket").socket()
     sock.bind(("127.0.0.1", 0))
@@ -742,9 +762,12 @@ def test_subprocess_exits_when_listen_never_happens(tmp_path: Any) -> None:
         [
             sys.executable,
             "-c",
-            "import hang_uvicorn, sys; "
+            "import sys, time; "
             f"sys.argv=['codex-lb','--port','{free_port}']; "
-            "from app.cli import main; main()",
+            "from app import cli; "
+            "cli._import_asgi_app = lambda: None; "
+            "cli._run_server = lambda *a, **k: time.sleep(8); "
+            "cli.main()",
         ],
         cwd=str(root),
         env=env,
@@ -757,10 +780,10 @@ def test_subprocess_exits_when_listen_never_happens(tmp_path: Any) -> None:
 
 
 def test_importing_cli_does_not_import_app_main() -> None:
-    """Listen watch cannot start until app.cli finishes importing.
+    """Importing the CLI module must not pull app.main.
 
-    uvicorn load_app() is the heavy import; importing the CLI module must not
-    pull app.main (FastAPI/SQLite) at module load.
+    Heavy FastAPI/SQLite import happens on the serve path after argv validation
+    and before the listen clock starts, not at ``import app.cli``.
     """
     import subprocess
     from pathlib import Path

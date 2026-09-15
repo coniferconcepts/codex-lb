@@ -1,10 +1,12 @@
 """Bound pre-listen startup work so KeepAlive sees a typed fail_startup reason.
 
 The CLI listen watcher (`reason=listen_timeout`) is a last-resort: it fires when
-the process never binds the port. Lifespan work that can block on SQLite or
-leader-election MUST finish or fail inside the same ``CODEX_LB_LISTEN_TIMEOUT_SECONDS``
-window, minus a short margin so this module can log and ``os._exit`` before the
-watcher prints the opaque ``listen_timeout`` line.
+the process never binds the port. The CLI imports ``app.main`` *before* starting
+that clock so a cold import cannot spend the whole window. Lifespan work that
+can block on SQLite or leader-election MUST finish or fail inside the same
+``CODEX_LB_LISTEN_TIMEOUT_SECONDS`` window, minus a short margin so this module
+can log and ``os._exit`` before the watcher prints the opaque ``listen_timeout``
+line.
 
 ``start_startup_budget_watch`` covers the whole pre-yield window, including
 sync work that would otherwise freeze ``asyncio.wait``. Start it from lifespan

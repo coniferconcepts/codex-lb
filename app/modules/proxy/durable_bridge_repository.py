@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Mapping, Sequence
@@ -2407,6 +2408,7 @@ class DurableBridgeRepository:
                     )
                 await self._session.commit()
             deleted_count += len(deleted_ids)
+            await asyncio.sleep(0)
 
     async def purge_closed_before(self, cutoff: datetime, *, batch_size: int = _PURGE_CLOSED_BATCH_SIZE) -> int:
         deleted_count = 0

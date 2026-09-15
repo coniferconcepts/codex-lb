@@ -81,8 +81,7 @@ from app.db.session import (
     close_session,
     init_background_db,
     init_db,
-    run_sqlite_startup_integrity_check,
-    run_sqlite_startup_schema_drift_check,
+    run_post_listen_sqlite_checks,
 )
 from app.modules.accounts import api as accounts_api
 from app.modules.accounts.deletion import build_account_deletion_scheduler
@@ -448,6 +447,7 @@ async def lifespan(app: FastAPI):
                     "Purged expired durable HTTP bridge operation transcript rows",
                     extra={"deleted": purged_operation_rows},
                 )
+        await asyncio.sleep(0)
         # The poller MUST be installed before the model scheduler starts: a first
         # leader tick that persists a changed snapshot bumps the model_registry
         # namespace through the global poller, and a not-yet-installed poller would
@@ -555,19 +555,23 @@ async def lifespan(app: FastAPI):
         # even if a nested lifespan on another loop replaces the module-global
         # singleton in the meantime; shutdown below stops exactly this instance.
         live_usage_ingestor = start_live_usage_ingestor()
-        await usage_scheduler.start()
-        await api_key_limit_reset_scheduler.start()
-        await api_key_last_used_flush_scheduler.start()
-        await model_scheduler.start()
-        await sticky_session_cleanup_scheduler.start()
-        await quota_planner_scheduler.start()
-        await auth_guardian_scheduler.start()
-        await automations_scheduler.start()
-        await rate_limit_reset_credits_scheduler.start()
-        await account_usage_rollup_scheduler.start()
-        await account_deletion_scheduler.start()
-        await data_retention_scheduler.start()
-        await telemetry_scheduler.start()
+        for scheduler in (
+            usage_scheduler,
+            api_key_limit_reset_scheduler,
+            api_key_last_used_flush_scheduler,
+            model_scheduler,
+            sticky_session_cleanup_scheduler,
+            quota_planner_scheduler,
+            auth_guardian_scheduler,
+            automations_scheduler,
+            rate_limit_reset_credits_scheduler,
+            account_usage_rollup_scheduler,
+            account_deletion_scheduler,
+            data_retention_scheduler,
+            telemetry_scheduler,
+        ):
+            await scheduler.start()
+            await asyncio.sleep(0)
         if settings.metrics_enabled and PROMETHEUS_AVAILABLE:
             import uvicorn
 
@@ -679,18 +683,7 @@ async def lifespan(app: FastAPI):
             )
         startup_module.mark_startup_complete()
         mark_pre_listen_complete()
-
-        async def _run_post_listen_sqlite_checks() -> None:
-            try:
-                await run_sqlite_startup_integrity_check()
-            except Exception:
-                logger.exception("Post-listen SQLite startup integrity check failed")
-            try:
-                await run_sqlite_startup_schema_drift_check()
-            except Exception:
-                logger.exception("Post-listen schema drift check failed")
-
-        asyncio.create_task(_run_post_listen_sqlite_checks())
+        asyncio.create_task(run_post_listen_sqlite_checks())
 
 
     warmup_task = asyncio.create_task(_complete_startup())

@@ -434,6 +434,25 @@ async def run_sqlite_startup_schema_drift_check() -> None:
     raise RuntimeError(f"Schema drift detected after startup migrations: {drift_details}")
 
 
+async def run_post_listen_sqlite_checks() -> None:
+    """Integrity/drift after bind. Sidecars skip so /health/live keeps the loop."""
+    from app.core.startup_budget import skip_post_listen_sqlite_checks
+
+    if skip_post_listen_sqlite_checks():
+        logger.info(
+            "Skipping post-listen SQLite integrity/drift checks so /health/live keeps the event loop"
+        )
+        return
+    try:
+        await run_sqlite_startup_integrity_check()
+    except Exception:
+        logger.exception("Post-listen SQLite startup integrity check failed")
+    try:
+        await run_sqlite_startup_schema_drift_check()
+    except Exception:
+        logger.exception("Post-listen schema drift check failed")
+
+
 async def _shielded(awaitable: Awaitable[object]) -> None:
     task = asyncio.ensure_future(awaitable)
     cancellation: asyncio.CancelledError | None = None

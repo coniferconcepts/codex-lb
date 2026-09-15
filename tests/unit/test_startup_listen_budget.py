@@ -378,3 +378,52 @@ def test_startup_budget_watch_does_not_exit_after_pre_listen_complete(
     time.sleep(0.8)
 
     assert not fired.is_set()
+
+
+def test_skip_post_listen_sqlite_checks_reads_sidecar_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CODEX_LB_SKIP_POST_LISTEN_SQLITE", raising=False)
+    assert startup_budget_module.skip_post_listen_sqlite_checks() is False
+    monkeypatch.setenv("CODEX_LB_SKIP_POST_LISTEN_SQLITE", "1")
+    assert startup_budget_module.skip_post_listen_sqlite_checks() is True
+    monkeypatch.setenv("CODEX_LB_SKIP_POST_LISTEN_SQLITE", "no")
+    assert startup_budget_module.skip_post_listen_sqlite_checks() is False
+
+
+@pytest.mark.asyncio
+async def test_run_post_listen_sqlite_checks_skips_when_sidecar_flag_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.db import session as session_module
+
+    called: list[str] = []
+
+    async def boom() -> None:
+        called.append("ran")
+        raise AssertionError("post-listen SQLite must not run on the sidecar")
+
+    monkeypatch.setenv("CODEX_LB_SKIP_POST_LISTEN_SQLITE", "1")
+    monkeypatch.setattr(session_module, "run_sqlite_startup_integrity_check", boom)
+    monkeypatch.setattr(session_module, "run_sqlite_startup_schema_drift_check", boom)
+    await session_module.run_post_listen_sqlite_checks()
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_run_post_listen_sqlite_checks_runs_without_sidecar_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.db import session as session_module
+
+    called: list[str] = []
+
+    async def integrity() -> None:
+        called.append("integrity")
+
+    async def drift() -> None:
+        called.append("drift")
+
+    monkeypatch.delenv("CODEX_LB_SKIP_POST_LISTEN_SQLITE", raising=False)
+    monkeypatch.setattr(session_module, "run_sqlite_startup_integrity_check", integrity)
+    monkeypatch.setattr(session_module, "run_sqlite_startup_schema_drift_check", drift)
+    await session_module.run_post_listen_sqlite_checks()
+    assert called == ["integrity", "drift"]

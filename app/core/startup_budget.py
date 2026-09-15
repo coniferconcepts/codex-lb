@@ -180,6 +180,17 @@ def remaining_lifespan_budget_seconds(*, monotonic: Callable[[], float] = time.m
     return remaining
 
 
+def skip_post_listen_sqlite_checks(environ: Mapping[str, str] | None = None) -> bool:
+    """LaunchAgent sidecars skip post-listen integrity/drift so /health/live stays on-loop.
+
+    Ticket 02 / issue #7: integrity_check and Alembic reflection on a large
+    store.db starve the event loop after bind. Fail-closed Alembic already ran
+    before yield.
+    """
+    raw = ((environ or os.environ).get("CODEX_LB_SKIP_POST_LISTEN_SQLITE") or "").strip().casefold()
+    return raw in {"1", "true", "yes"}
+
+
 def is_pre_listen_startup() -> bool:
     return _watch_started_at is not None and not _pre_listen_complete
 

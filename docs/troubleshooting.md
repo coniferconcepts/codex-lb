@@ -1,5 +1,19 @@
 # Troubleshooting
 
+## LaunchAgent / laptop sidecar
+
+On this operator stack, macOS LaunchAgent supervision (watchdog grace, env-parse
+timeout, `ExitTimeOut`) lives in sibling **opencode-router**:
+[`docs/CODEX_LB_SIDECAR.md`](https://github.com/coniferconcepts/opencode-router/blob/development/docs/CODEX_LB_SIDECAR.md)
+(local: `~/CODE/opencode-router/docs/CODEX_LB_SIDECAR.md`).
+
+- Do not WAL-checkpoint as the first repair for `database is locked` during a
+  restart; that was overlapping writer versus teardown.
+- Env-parse hangs are the **router launcher** (`timeout_exec.pl`), not `app.cli`.
+- `CODEX_LB_SKIP_POST_LISTEN_SQLITE=1` skips post-listen integrity/drift so
+  `/health/live` stays on-loop. Router sidecar launchers default this on; the
+  app reads the env in `app/core/startup_budget.py`.
+
 ## Usage and quota
 
 **Why does codex-lb still say `rate_limited` when Codex Desktop says the window reset?**

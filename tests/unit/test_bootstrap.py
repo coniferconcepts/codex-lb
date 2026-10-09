@@ -180,6 +180,7 @@ def test_log_bootstrap_token_redacts_secret_by_default() -> None:
     """
     import io
     import logging
+
     handler_stream = io.StringIO()
     handler = logging.StreamHandler(handler_stream)
     handler.setLevel(logging.WARNING)

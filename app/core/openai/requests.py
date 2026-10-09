@@ -323,6 +323,7 @@ class ResponsesRequest(BaseModel):
     reasoning: ResponsesReasoning | None = None
     store: bool = False
     stream: bool | None = None
+    max_output_tokens: int | None = None
     include: list[str] = Field(default_factory=list)
     service_tier: str | None = None
     conversation: str | None = None
@@ -330,6 +331,13 @@ class ResponsesRequest(BaseModel):
     truncation: str | None = None
     prompt_cache_key: str | None = None
     text: ResponsesTextControls | None = None
+
+    @field_validator("max_output_tokens", mode="before")
+    @classmethod
+    def _validate_max_output_tokens(cls, value: JsonValue) -> int:
+        if type(value) is not int or value <= 0:
+            raise ValueError("max_output_tokens must be a positive integer")
+        return value
 
     @field_validator("input")
     @classmethod

@@ -374,7 +374,7 @@ class ProxyService:
         dashboard_settings = await get_settings_cache().get()
         runtime_config = _http_bridge_runtime_config(dashboard_settings, get_settings())
         if not runtime_config.enabled:
-            async for line in self._stream_with_retry(
+            stream = self._stream_with_retry(
                 payload,
                 headers,
                 codex_session_affinity=codex_session_affinity,
@@ -384,31 +384,34 @@ class ProxyService:
                 api_key_reservation=api_key_reservation,
                 suppress_text_done_events=suppress_text_done_events,
                 request_transport=_REQUEST_TRANSPORT_HTTP,
-            ):
+            )
+        else:
+            stream = self._stream_via_http_bridge(
+                payload,
+                headers,
+                codex_session_affinity=codex_session_affinity,
+                propagate_http_errors=propagate_http_errors,
+                openai_cache_affinity=openai_cache_affinity,
+                api_key=api_key,
+                api_key_reservation=api_key_reservation,
+                suppress_text_done_events=suppress_text_done_events,
+                idle_ttl_seconds=runtime_config.idle_ttl_seconds,
+                codex_idle_ttl_seconds=runtime_config.codex_idle_ttl_seconds,
+                max_sessions=runtime_config.max_sessions,
+                queue_limit=runtime_config.queue_limit,
+                prompt_cache_idle_ttl_seconds=runtime_config.prompt_cache_idle_ttl_seconds,
+                downstream_turn_state=downstream_turn_state,
+                forwarded_request=forwarded_request,
+                proxy_api_authorization=proxy_api_authorization,
+                forwarded_affinity_kind=forwarded_affinity_kind,
+                forwarded_affinity_key=forwarded_affinity_key,
+            )
+        inner_stream = cast(AsyncGenerator[str, None], stream)
+        try:
+            async for line in inner_stream:
                 yield line
-            return
-
-        async for line in self._stream_via_http_bridge(
-            payload,
-            headers,
-            codex_session_affinity=codex_session_affinity,
-            propagate_http_errors=propagate_http_errors,
-            openai_cache_affinity=openai_cache_affinity,
-            api_key=api_key,
-            api_key_reservation=api_key_reservation,
-            suppress_text_done_events=suppress_text_done_events,
-            idle_ttl_seconds=runtime_config.idle_ttl_seconds,
-            codex_idle_ttl_seconds=runtime_config.codex_idle_ttl_seconds,
-            max_sessions=runtime_config.max_sessions,
-            queue_limit=runtime_config.queue_limit,
-            prompt_cache_idle_ttl_seconds=runtime_config.prompt_cache_idle_ttl_seconds,
-            downstream_turn_state=downstream_turn_state,
-            forwarded_request=forwarded_request,
-            proxy_api_authorization=proxy_api_authorization,
-            forwarded_affinity_kind=forwarded_affinity_kind,
-            forwarded_affinity_key=forwarded_affinity_key,
-        ):
-            yield line
+        finally:
+            await inner_stream.aclose()
 
     async def _stream_via_http_bridge(
         self,

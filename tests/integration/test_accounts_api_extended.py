@@ -5,16 +5,16 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, text, update
 
 from app.core.auth import fallback_account_id, generate_unique_account_id
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import Account, AccountStatus, AdditionalUsageHistory
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
-from app.modules.usage.repository import UsageRepository
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 pytestmark = pytest.mark.integration
 
@@ -351,6 +351,163 @@ async def test_accounts_list_includes_per_account_reset_times(async_client, db_s
     assert accounts["acc_reset_b"]["windowMinutesPrimary"] == 300
     assert accounts["acc_reset_a"]["windowMinutesSecondary"] == 10080
     assert accounts["acc_reset_b"]["windowMinutesSecondary"] == 10080
+
+
+@pytest.mark.asyncio
+async def test_accounts_list_scopes_latest_usage_to_loaded_accounts(async_client, db_setup):
+    now = utcnow()
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        additional_repo = AdditionalUsageRepository(session)
+        await accounts_repo.upsert(_make_account("acc_latest_a", "latest-a@example.com"))
+        await accounts_repo.upsert(_make_account("acc_latest_b", "latest-b@example.com"))
+        await accounts_repo.upsert(_make_account("acc_latest_empty", "latest-empty@example.com"))
+
+        await usage_repo.add_entry("acc_latest_a", 10.0, window="primary", recorded_at=now - timedelta(hours=2))
+        await usage_repo.add_entry("acc_latest_b", 20.0, window="primary", recorded_at=now - timedelta(hours=1))
+        await usage_repo.add_entry("acc_latest_a", 25.0, window="primary", recorded_at=now)
+        await usage_repo.add_entry("acc_latest_b", 45.0, window="primary", recorded_at=now)
+        await additional_repo.add_entry(
+            "acc_latest_a",
+            "codex_spark",
+            "codex_spark",
+            "primary",
+            15.0,
+            recorded_at=now - timedelta(hours=1),
+        )
+        await additional_repo.add_entry(
+            "acc_latest_b",
+            "codex_spark",
+            "codex_spark",
+            "primary",
+            35.0,
+            recorded_at=now,
+        )
+
+    response = await async_client.get("/api/accounts")
+    assert response.status_code == 200
+    accounts = {item["accountId"]: item for item in response.json()["accounts"]}
+
+    assert accounts["acc_latest_a"]["usage"]["primaryRemainingPercent"] == pytest.approx(75.0)
+    assert accounts["acc_latest_b"]["usage"]["primaryRemainingPercent"] == pytest.approx(55.0)
+    assert accounts["acc_latest_a"]["additionalQuotas"][0]["primaryWindow"]["usedPercent"] == pytest.approx(15.0)
+    assert accounts["acc_latest_b"]["additionalQuotas"][0]["primaryWindow"]["usedPercent"] == pytest.approx(35.0)
+
+    empty_account = accounts["acc_latest_empty"]
+    assert empty_account["resetAtPrimary"] is None
+    assert empty_account["resetAtSecondary"] is None
+    assert empty_account["windowMinutesPrimary"] is None
+    assert empty_account["windowMinutesSecondary"] is None
+    assert empty_account["additionalQuotas"] == []
+
+
+@pytest.mark.asyncio
+async def test_accounts_list_excludes_orphan_additional_usage_from_endpoint_scope(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    orphan_account_id = "orphan_acc"
+    account_ids = ["acc_scoped", "acc_scoped_empty"]
+    fetched_account_ids = ["acc_scoped_empty", "acc_scoped"]
+    now = utcnow()
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        additional_repo = AdditionalUsageRepository(session)
+        await accounts_repo.upsert(_make_account(orphan_account_id, "orphan@example.com"))
+        await additional_repo.add_entry(
+            orphan_account_id,
+            "codex_spark",
+            "codex_spark",
+            "primary",
+            99.0,
+            recorded_at=now,
+        )
+
+        dialect_name = session.get_bind().dialect.name
+        if dialect_name == "sqlite":
+            await session.execute(text("PRAGMA foreign_keys = OFF"))
+            restore_foreign_keys = "PRAGMA foreign_keys = ON"
+        elif dialect_name == "postgresql":
+            await session.execute(text("SET session_replication_role = replica"))
+            restore_foreign_keys = "SET session_replication_role = origin"
+        else:
+            pytest.skip(f"Unsupported database dialect for orphan-row setup: {dialect_name}")
+        assert await accounts_repo.delete(orphan_account_id) is True
+        await session.execute(text(restore_foreign_keys))
+        await session.commit()
+
+        orphan_row = (
+            await session.execute(
+                select(AdditionalUsageHistory).where(AdditionalUsageHistory.account_id == orphan_account_id)
+            )
+        ).scalar_one()
+        assert orphan_row.account_id == orphan_account_id
+
+        await accounts_repo.upsert(_make_account(account_ids[0], "scoped@example.com"))
+        await accounts_repo.upsert(_make_account(account_ids[1], "scoped-empty@example.com"))
+        usage_repo = UsageRepository(session)
+        await usage_repo.add_entry(account_ids[0], 25.0, window="primary", recorded_at=now)
+        await additional_repo.add_entry(
+            account_ids[0],
+            "codex_spark",
+            "codex_spark",
+            "primary",
+            15.0,
+            recorded_at=now,
+        )
+
+    original_list_quota_keys = AdditionalUsageRepository.list_quota_keys
+    original_latest_by_account = AdditionalUsageRepository.latest_by_account
+    list_quota_keys_calls: list[list[str] | None] = []
+    latest_calls: list[tuple[str | None, str | None, list[str] | None]] = []
+
+    async def capture_list_quota_keys(
+        repository: AdditionalUsageRepository,
+        *,
+        account_ids: list[str] | None = None,
+        since=None,
+    ) -> list[str]:
+        list_quota_keys_calls.append(account_ids)
+        return await original_list_quota_keys(repository, account_ids=account_ids, since=since)
+
+    async def capture_latest_by_account(
+        repository: AdditionalUsageRepository,
+        quota_key: str | None = None,
+        window: str | None = None,
+        *,
+        limit_name: str | None = None,
+        account_ids: list[str] | None = None,
+        since=None,
+    ) -> dict[str, AdditionalUsageHistory]:
+        latest_calls.append((quota_key, window, account_ids))
+        return await original_latest_by_account(
+            repository,
+            quota_key,
+            window,
+            limit_name=limit_name,
+            account_ids=account_ids,
+            since=since,
+        )
+
+    monkeypatch.setattr(AdditionalUsageRepository, "list_quota_keys", capture_list_quota_keys)
+    monkeypatch.setattr(AdditionalUsageRepository, "latest_by_account", capture_latest_by_account)
+
+    response = await async_client.get("/api/accounts")
+    assert response.status_code == 200
+    accounts = {item["accountId"]: item for item in response.json()["accounts"]}
+
+    assert set(accounts) == set(account_ids)
+    assert accounts[account_ids[0]]["usage"]["primaryRemainingPercent"] == pytest.approx(75.0)
+    assert accounts[account_ids[0]]["additionalQuotas"][0]["primaryWindow"]["usedPercent"] == pytest.approx(15.0)
+    assert accounts[account_ids[1]]["additionalQuotas"] == []
+    assert list_quota_keys_calls == [fetched_account_ids]
+    assert latest_calls == [
+        ("codex_spark", "primary", fetched_account_ids),
+        ("codex_spark", "secondary", fetched_account_ids),
+    ]
 
 
 @pytest.mark.asyncio

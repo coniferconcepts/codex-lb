@@ -61,8 +61,16 @@ class AccountsService:
             return []
         account_ids = [account.id for account in accounts]
         account_id_set = set(account_ids)
-        primary_usage = await self._usage_repo.latest_by_account(window="primary") if self._usage_repo else {}
-        secondary_usage = await self._usage_repo.latest_by_account(window="secondary") if self._usage_repo else {}
+        primary_usage = (
+            await self._usage_repo.latest_by_account(window="primary", account_ids=account_ids)
+            if self._usage_repo
+            else {}
+        )
+        secondary_usage = (
+            await self._usage_repo.latest_by_account(window="secondary", account_ids=account_ids)
+            if self._usage_repo
+            else {}
+        )
         request_usage_rows = await self._repo.list_request_usage_summary_by_account(account_ids)
         request_usage_by_account = {
             account_id: AccountRequestUsage(
@@ -78,8 +86,16 @@ class AccountsService:
         if additional_usage_repo:
             quota_keys = await additional_usage_repo.list_quota_keys(account_ids=account_ids)
             for quota_key in quota_keys:
-                primary_entries = await additional_usage_repo.latest_by_account(quota_key, "primary")
-                secondary_entries = await additional_usage_repo.latest_by_account(quota_key, "secondary")
+                primary_entries = await additional_usage_repo.latest_by_account(
+                    quota_key,
+                    "primary",
+                    account_ids=account_ids,
+                )
+                secondary_entries = await additional_usage_repo.latest_by_account(
+                    quota_key,
+                    "secondary",
+                    account_ids=account_ids,
+                )
                 for account_id in (set(primary_entries) | set(secondary_entries)) & account_id_set:
                     primary_entry = primary_entries.get(account_id)
                     secondary_entry = secondary_entries.get(account_id)

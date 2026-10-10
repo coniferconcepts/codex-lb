@@ -158,16 +158,26 @@ class UsageRepository:
             for row in rows
         ]
 
-    async def latest_by_account(self, window: str | None = None) -> dict[str, UsageHistory]:
-        conditions = _window_clause(window)
+    async def latest_by_account(
+        self,
+        window: str | None = None,
+        *,
+        account_ids: Collection[str] | None = None,
+    ) -> dict[str, UsageHistory]:
+        conditions = [_window_clause(window)]
+        if account_ids is not None:
+            conditions.append(UsageHistory.account_id.in_(account_ids))
         bind = self._session.get_bind()
         dialect = bind.dialect.name if bind else "sqlite"
         if dialect == "postgresql":
-            acct_subq = select(Account.id).subquery("accts")
+            acct_query = select(Account.id)
+            if account_ids is not None:
+                acct_query = acct_query.where(Account.id.in_(account_ids))
+            acct_subq = acct_query.subquery("accts")
             lateral = (
                 select(UsageHistory.id)
                 .where(
-                    conditions,
+                    *conditions,
                     UsageHistory.account_id == acct_subq.c.id,
                 )
                 .order_by(UsageHistory.recorded_at.desc(), UsageHistory.id.desc())
@@ -191,7 +201,7 @@ class UsageRepository:
                 )
                 .label("row_number"),
             )
-            .where(conditions)
+            .where(*conditions)
             .subquery()
         )
         stmt = select(UsageHistory).join(subq, UsageHistory.id == subq.c.usage_id).where(subq.c.row_number == 1)

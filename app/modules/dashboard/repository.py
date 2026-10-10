@@ -22,8 +22,12 @@ class DashboardRepository:
     async def list_accounts(self) -> list[Account]:
         return await self._accounts_repo.list_accounts()
 
-    async def latest_usage_by_account(self, window: str) -> dict[str, UsageHistory]:
-        return await self._usage_repo.latest_by_account(window=window)
+    async def latest_usage_by_account(
+        self,
+        window: str,
+        account_ids: Collection[str] | None = None,
+    ) -> dict[str, UsageHistory]:
+        return await self._usage_repo.latest_by_account(window=window, account_ids=account_ids)
 
     async def usage_history_since(
         self,

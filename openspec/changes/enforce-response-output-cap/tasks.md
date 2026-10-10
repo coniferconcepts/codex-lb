@@ -15,3 +15,8 @@ Tests, lint, and type checking pass. See [verification](verification.md) for the
 - [x] Apply the cap after public normalization for streamed and collected output.
 - [x] Run the four requested test suites, Ruff lint, changed-file formatting, type checking, and diff whitespace verification; record exits.
 - [ ] Complete repository formatting, OpenSpec CLI validation, and read-only Sol review; see environment blockers in verification.md.
+
+## PR #11 P2 disconnect follow-up
+- [ ] Reproduce upstream closure failure through the public service with real retry and attempt generators, stubbing only upstream transport.
+- [ ] Close each attempt generator and its upstream iterator on downstream closure.
+- [ ] Run output-cap and proxy unit tests, pinned Ruff checks, and repository type checking; record before and after exits.

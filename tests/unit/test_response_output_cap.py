@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -16,10 +17,15 @@ from starlette.types import Message
 import app.modules.proxy.api as api
 import app.modules.proxy.service as proxy_service
 from app.core.config.settings import Settings
+from app.core.crypto import TokenEncryptor
 from app.core.openai.output_cap import estimate_output_tokens, limit_response_stream
+from app.core.openai.requests import ResponsesRequest
 from app.core.openai.v1_requests import V1ResponsesRequest
 from app.core.types import JsonValue
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.db.models import Account, AccountStatus
+from app.db.session import SessionLocal
+from app.dependencies import _proxy_repo_context
 
 
 @pytest.mark.parametrize(("chars", "tokens"), [(0, 0), (1, 1), (3, 1), (4, 2), (7, 3)])
@@ -596,3 +602,54 @@ async def test_review_cap_drains_error_terminal_before_incomplete() -> None:
     assert events[-1] is not None and events[-1]["type"] == "response.incomplete"
     response = cast(dict[str, JsonValue], events[-1]["response"])
     assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+
+
+@pytest.mark.parametrize("service_path", ["direct", "http"])
+@pytest.mark.parametrize("cap", [None, 2])
+@pytest.mark.parametrize("disconnect_after", [1, 2])
+async def test_service_disconnect_closes_real_retry_upstream(
+    monkeypatch: pytest.MonkeyPatch, db_setup: bool, service_path: str, cap: int | None, disconnect_after: int
+) -> None:
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc_disconnect",
+        chatgpt_account_id="workspace-disconnect",
+        email="disconnect@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access"),
+        refresh_token_encrypted=encryptor.encrypt("refresh"),
+        id_token_encrypted=encryptor.encrypt("id"),
+        last_refresh=datetime.now(timezone.utc),
+        status=AccountStatus.ACTIVE,
+    )
+    async with SessionLocal() as session:
+        session.add(account)
+        await session.commit()
+
+    closed = False
+
+    async def upstream(*_args, **_kwargs) -> AsyncGenerator[str, None]:
+        nonlocal closed
+        try:
+            yield block("response.created", response={"id": "resp_disconnect"})
+            yield block("response.output_text.delta", delta="abc", output_index=0)
+            yield block("response.completed", response={"status": "completed", "output": []})
+        finally:
+            closed = True
+
+    inner_stream = upstream()
+    monkeypatch.setattr(proxy_service, "core_stream_responses", lambda *_args, **_kwargs: inner_stream)
+    service = proxy_service.ProxyService(_proxy_repo_context)
+    payload = ResponsesRequest(model="gpt-5.1", input="hi", instructions="hi")
+    public_stream = service.stream_http_responses if service_path == "http" else service.stream_responses
+    stream = cast(AsyncGenerator[str, None], limit_response_stream(public_stream(payload, {}), cap))
+    try:
+        for _ in range(disconnect_after):
+            event = parse_sse_data_json(await anext(stream))
+            assert event is not None and event["type"] != "response.failed"
+        await stream.aclose()
+        assert closed
+        assert inner_stream.ag_frame is None
+    finally:
+        await stream.aclose()
+        await inner_stream.aclose()

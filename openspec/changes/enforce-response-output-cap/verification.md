@@ -49,3 +49,26 @@ A bounded inline self-review checked the implementation and API diff against all
 - Required read-only Sol-high contract review through `codex-lean-lane security`: exit 1 before review started, including the follow-up attempt scoped to P2/P3. The pinned lane uses `gpt-6.1-sol`, high effort, and a read-only sandbox. CLI initialization failed with `Read-only file system (os error 30)`. No reviewer verdict was produced.
 
 The code corrections are implemented. The full local gate and independent review remain incomplete, so the change is not archived.
+
+## PR #11 P2: real retry-path disconnect regression (blocked)
+
+Added `test_service_disconnect_closes_real_retry_upstream` before changing production code. It creates a fresh encrypted test account in the real repository and calls `stream_responses` or `stream_http_responses` with the bridge disabled. Only `core_stream_responses` is replaced. The test covers absent and present caps and closure after the first or second event. It retains the upstream generator and checks both its cleanup flag and `ag_frame` immediately after outer `aclose()`, before test cleanup.
+
+The regression has not reached its closure assertion in this environment. Database setup hangs in aiosqlite. A standalone in-memory aiosqlite connection also timed out (exit 124 after eight seconds). An existing proxy test hits the same database timeout. This is not evidence of a failing closure assertion. Production code is untouched because the assignment requires a failing regression before the fix, and the operating rules prohibit workarounds.
+
+Run these commands from the assignment worktree. The table records results after adding the test and before any production fix. After-fix results are unavailable.
+
+| Verifier | Exit | Result |
+| --- | --- | --- |
+| `.venv/bin/python -m pytest -q tests/unit/test_response_output_cap.py -k 'not test_service_disconnect_closes_real_retry_upstream' --tb=short` | 0 | 80 passed, eight deselected. |
+| `timeout 60 .venv/bin/python -m pytest -q tests/unit/test_response_output_cap.py --tb=short --timeout=10 --maxfail=1` | 1 | 80 passed, then regression database fixture timed out. |
+| `timeout 60 .venv/bin/python -m pytest -q tests/unit/test_proxy_*.py --tb=short --timeout=10 --maxfail=1` | 1 | 40 passed, then an existing HTTP bridge test timed out in aiosqlite. |
+| `uvx ruff@0.15.1 check app/modules/proxy/service.py tests/unit/test_response_output_cap.py` | 2 | Default tool cache is read-only. |
+| `uvx ruff@0.15.1 format --check app/modules/proxy/service.py tests/unit/test_response_output_cap.py` | 2 | Default tool cache is read-only. |
+| `UV_CACHE_DIR=/tmp/response-cap-uv-cache UV_TOOL_DIR=/tmp/response-cap-uv-tools uvx --offline ruff@0.15.1 check app/modules/proxy/service.py tests/unit/test_response_output_cap.py` | 1 | Ruff is absent from the writable cache. Online resolution also failed with blocked DNS (exit 2). |
+| `UV_CACHE_DIR=/tmp/response-cap-uv-cache UV_TOOL_DIR=/tmp/response-cap-uv-tools uvx --offline ruff@0.15.1 format --check app/modules/proxy/service.py tests/unit/test_response_output_cap.py` | 1 | Ruff is absent from the writable cache. |
+| `.venv/bin/python -m ruff check app/modules/proxy/service.py tests/unit/test_response_output_cap.py` | 0 | Installed Ruff is version 0.15.1. |
+| `.venv/bin/python -m ruff format --check app/modules/proxy/service.py tests/unit/test_response_output_cap.py` | 0 | Both files are formatted. |
+| `.venv/bin/python -m ty check` | 0 | Repository type check passed. |
+
+Next verification must first reach and fail the upstream closure assertion with unchanged production code. Then close both `_stream_once` call sites in `_stream_with_retry`, including the forced-refresh path, and close the upstream iterator owned by `_stream_once`. Retry timeout overrides must remain active until attempt cleanup finishes. Rerun all requested checks and obtain the required read-only review. The change remains unverified and unarchived.

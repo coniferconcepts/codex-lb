@@ -9,6 +9,7 @@ import re
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Collection, Sequence
+from contextlib import aclosing
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -6692,24 +6693,27 @@ class ProxyService:
                         )
                         try:
                             settlement = _StreamSettlement()
-                            async for line in self._stream_once(
-                                account,
-                                payload,
-                                headers,
-                                request_id,
-                                allow_retry_flag,
-                                request_started_at=start,
-                                allow_transient_retry=(
-                                    transient_retries < _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES - 1 or allow_retry_flag
-                                ),
-                                api_key=api_key,
-                                settlement=settlement,
-                                suppress_text_done_events=suppress_text_done_events,
-                                upstream_stream_transport=upstream_stream_transport,
-                                request_transport=request_transport,
-                                preferred_account_id=preferred_account_id,
-                            ):
-                                yield line
+                            async with aclosing(
+                                self._stream_once(
+                                    account,
+                                    payload,
+                                    headers,
+                                    request_id,
+                                    allow_retry_flag,
+                                    request_started_at=start,
+                                    allow_transient_retry=(
+                                        transient_retries < _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES - 1 or allow_retry_flag
+                                    ),
+                                    api_key=api_key,
+                                    settlement=settlement,
+                                    suppress_text_done_events=suppress_text_done_events,
+                                    upstream_stream_transport=upstream_stream_transport,
+                                    request_transport=request_transport,
+                                    preferred_account_id=preferred_account_id,
+                                )
+                            ) as attempt_lines:
+                                async for line in attempt_lines:
+                                    yield line
                         except (_TransientStreamError, ProxyResponseError) as tex:
                             if isinstance(tex, ProxyResponseError) and tex.status_code != 500:
                                 error = _parse_openai_error(tex.payload)
@@ -6903,20 +6907,23 @@ class ProxyService:
                             return
                         stream_timeout_tokens = _push_stream_attempt_timeout_overrides(effective_attempt_timeout)
                         try:
-                            async for line in self._stream_once(
-                                account,
-                                payload,
-                                headers,
-                                request_id,
-                                False,
-                                request_started_at=start,
-                                api_key=api_key,
-                                settlement=settlement,
-                                suppress_text_done_events=suppress_text_done_events,
-                                upstream_stream_transport=upstream_stream_transport,
-                                request_transport=request_transport,
-                            ):
-                                yield line
+                            async with aclosing(
+                                self._stream_once(
+                                    account,
+                                    payload,
+                                    headers,
+                                    request_id,
+                                    False,
+                                    request_started_at=start,
+                                    api_key=api_key,
+                                    settlement=settlement,
+                                    suppress_text_done_events=suppress_text_done_events,
+                                    upstream_stream_transport=upstream_stream_transport,
+                                    request_transport=request_transport,
+                                )
+                            ) as attempt_lines:
+                                async for line in attempt_lines:
+                                    yield line
                         finally:
                             pop_stream_timeout_overrides(stream_timeout_tokens)
                         if settlement.account_health_error:
@@ -7034,7 +7041,7 @@ class ProxyService:
         upstream_stream_transport: str | None,
         request_transport: str,
         preferred_account_id: str | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncGenerator[str, None]:
         account_id_value = account.id
         access_token = self._encryptor.decrypt(account.access_token_encrypted)
         account_id = _header_account_id(account.chatgpt_account_id)
@@ -7053,6 +7060,7 @@ class ProxyService:
         saw_text_delta = False
         latency_first_token_ms: int | None = None
         response_create_lease = AdmissionLease(None)
+        stream: AsyncIterator[str] | None = None
 
         try:
             response_create_lease = await self._get_work_admission().acquire_response_create()
@@ -7293,6 +7301,9 @@ class ProxyService:
             raise
         finally:
             response_create_lease.release()
+            close_stream = getattr(stream, "aclose", None)
+            if close_stream is not None:
+                await close_stream()
             input_tokens = usage.input_tokens if usage else None
             output_tokens = usage.output_tokens if usage else None
             cached_input_tokens = (

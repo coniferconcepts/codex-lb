@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -23,6 +22,7 @@ from app.core.openai.requests import ResponsesRequest
 from app.core.openai.v1_requests import V1ResponsesRequest
 from app.core.types import JsonValue
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.dependencies import _proxy_repo_context
@@ -619,7 +619,7 @@ async def test_service_disconnect_closes_real_retry_upstream(
         access_token_encrypted=encryptor.encrypt("access"),
         refresh_token_encrypted=encryptor.encrypt("refresh"),
         id_token_encrypted=encryptor.encrypt("id"),
-        last_refresh=datetime.now(timezone.utc),
+        last_refresh=utcnow(),
         status=AccountStatus.ACTIVE,
     )
     async with SessionLocal() as session:

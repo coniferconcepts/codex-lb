@@ -7,11 +7,13 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from typing import Final, cast
 
+import anyio
 from fastapi import APIRouter, Body, Depends, File, Form, Request, Response, Security, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.types import Receive, Scope, Send
 
 from app.core import usage as usage_core
 from app.core.auth.dependencies import (
@@ -42,6 +44,7 @@ from app.core.openai.models import (
 from app.core.openai.models import (
     OpenAIErrorEnvelope as OpenAIErrorEnvelopeModel,
 )
+from app.core.openai.output_cap import limit_response_stream
 from app.core.openai.parsing import parse_response_payload
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
@@ -95,6 +98,25 @@ from app.modules.proxy.types import (
 from app.modules.usage.repository import UsageRepository
 
 logger = logging.getLogger(__name__)
+
+
+class _ResponsesStreamingResponse(StreamingResponse):
+    def __init__(self, first: str | None, stream: AsyncIterator[str], *, headers: Mapping[str, str]) -> None:
+        self._stream = stream
+        super().__init__(_prepend_first(first, stream), media_type="text/event-stream", headers=headers)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                close_body = getattr(self.body_iterator, "aclose", None)
+                if close_body is not None:
+                    await close_body()
+                close_stream = getattr(self._stream, "aclose", None)
+                if close_stream is not None:
+                    await close_stream()
+
 
 _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES = frozenset(
     {
@@ -1490,13 +1512,13 @@ async def _stream_responses(
             api_key_reservation=reservation,
             suppress_text_done_events=suppress_text_done_events,
         )
-    stream = _normalize_public_responses_stream(stream)
+    stream = limit_response_stream(_normalize_public_responses_stream(stream), payload.max_output_tokens)
     try:
         first = await stream.__anext__()
     except StopAsyncIteration:
-        return StreamingResponse(
-            _prepend_first(None, stream),
-            media_type="text/event-stream",
+        return _ResponsesStreamingResponse(
+            None,
+            stream,
             headers={"Cache-Control": "no-cache", **rate_limit_headers},
         )
     except ProxyResponseError as exc:
@@ -1508,9 +1530,9 @@ async def _stream_responses(
             exc.payload,
             headers=rate_limit_headers,
         )
-    return StreamingResponse(
-        _prepend_first(first, stream),
-        media_type="text/event-stream",
+    return _ResponsesStreamingResponse(
+        first,
+        stream,
         headers={"Cache-Control": "no-cache", **turn_state_headers, **rate_limit_headers},
     )
 
@@ -1573,7 +1595,11 @@ async def _collect_responses(
             suppress_text_done_events=suppress_text_done_events,
         )
     try:
-        response_payload = await _collect_responses_payload(stream)
+        response_payload = await _collect_responses_payload(
+            limit_response_stream(
+                _normalize_public_responses_stream(stream), payload.max_output_tokens, stop_early=False
+            )
+        )
     except ProxyResponseError as exc:
         await _release_reservation(reservation)
         error = _parse_error_envelope(exc.payload)
@@ -1752,10 +1778,15 @@ async def codex_usage(
 
 
 async def _prepend_first(first: str | None, stream: AsyncIterator[str]) -> AsyncIterator[str]:
-    if first is not None:
-        yield first
-    async for line in stream:
-        yield line
+    try:
+        if first is not None:
+            yield first
+        async for line in stream:
+            yield line
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 def _parse_sse_payload(line: str) -> dict[str, JsonValue] | None:
@@ -2055,30 +2086,36 @@ def _merge_collected_output_items(
 async def _normalize_public_responses_stream(stream: AsyncIterator[str]) -> AsyncIterator[str]:
     terminal_seen = False
     contract_violation_kind: str | None = None
-    async for event_block in stream:
-        if event_block.strip() == "data: [DONE]":
-            if terminal_seen:
-                yield event_block
-            continue
-        payload = _parse_sse_payload(event_block)
-        if payload is None:
-            if _looks_like_sse_data_block(event_block):
-                contract_violation_kind = contract_violation_kind or "invalid_json"
-            continue
-        normalized_payload, violation_kind = _normalize_public_stream_payload(payload)
-        if violation_kind is not None:
-            contract_violation_kind = contract_violation_kind or violation_kind
-        if normalized_payload is None:
-            continue
-        event_type = normalized_payload.get("type")
-        if isinstance(event_type, str) and event_type in {
-            "response.completed",
-            "response.incomplete",
-            "response.failed",
-            "error",
-        }:
-            terminal_seen = True
-        yield format_sse_event(normalized_payload)
+    try:
+        async for event_block in stream:
+            if event_block.strip() == "data: [DONE]":
+                if terminal_seen:
+                    yield event_block
+                continue
+            payload = _parse_sse_payload(event_block)
+            if payload is None:
+                if _looks_like_sse_data_block(event_block):
+                    contract_violation_kind = contract_violation_kind or "invalid_json"
+                continue
+            normalized_payload, violation_kind = _normalize_public_stream_payload(payload)
+            if violation_kind is not None:
+                contract_violation_kind = contract_violation_kind or violation_kind
+            if normalized_payload is None:
+                continue
+            event_type = normalized_payload.get("type")
+            if isinstance(event_type, str) and event_type in {
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+                "error",
+            }:
+                terminal_seen = True
+            yield format_sse_event(normalized_payload)
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
+
     if terminal_seen:
         return
     error_kind = contract_violation_kind or "upstream_stream_truncated"
@@ -2094,8 +2131,10 @@ def _normalize_public_stream_payload(
     payload: dict[str, JsonValue],
 ) -> tuple[dict[str, JsonValue] | None, str | None]:
     event_type = payload.get("type")
-    if event_type in ("response.completed", "response.incomplete"):
-        response = payload.get("response")
+    response = payload.get("response")
+    if event_type in ("response.completed", "response.incomplete") or (
+        is_json_mapping(response) and isinstance(response.get("output"), list)
+    ):
         if not is_json_mapping(response):
             return (
                 cast(

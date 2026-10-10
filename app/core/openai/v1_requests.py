@@ -66,6 +66,8 @@ class V1ResponsesRequest(BaseModel):
 
     def to_responses_request(self) -> ResponsesRequest:
         data = self.model_dump(mode="json", exclude_none=True)
+        if self.model_extra is not None and "max_output_tokens" in self.model_extra:
+            data["max_output_tokens"] = self.model_extra["max_output_tokens"]
         messages = data.pop("messages", None)
         instructions = data.get("instructions")
         instruction_text = instructions if isinstance(instructions, str) else ""
